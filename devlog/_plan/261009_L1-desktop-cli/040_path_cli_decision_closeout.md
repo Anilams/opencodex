@@ -50,4 +50,5 @@ Decision unchanged: no Desktop PATH installer in this lane. What users get inste
   (or the `~/Applications` copy) when installed; a usable PATH Bun now runs the CLI instead of failing.
 - PR B (wp5): command guards so an updated CLI refuses to compete with the Desktop runtime.
 
-Follow-up (separate unit, not opened by this lane): the native "Install ocx command" design above.
+Follow-up (separate unit, not opened by this lane): the native "Install ocx command" design above. The coordinator
+thread took it on as `codex/desktop-owned-path-cli`; this lane does not touch that scope.
