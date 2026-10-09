@@ -25,3 +25,8 @@ Audit (reviewer 01a11e4b): GO-WITH-FIXES (blockers=1), folded:
 - 039 now exists on this branch too (copied from the launcher branch; identical content).
 - The macos 1/2 failure is retried as a whole failed job after the run completes; a repeat in the same batch is
   treated as real and investigated, not retried again.
+
+Check amendment (at B): run 37873621613 still had 10 queued/running jobs (Windows runner backlog), so its failed job
+cannot be retried yet and #6807's CI is pending. This cycle's C therefore checks the decision record (privacy and
+structure gates over the changed docs) and records the CI snapshot; the green-at-exact-head requirement for all three
+PRs is verified in wp5's C/D before c-5 is met. Nothing about c-5 is weakened.
