@@ -76,7 +76,8 @@ describe("bundledBunPath / durableBunPath", () => {
     expect(selected).not.toBeNull();
     const lateOverride = join(root, "dotenv-bun.exe");
     writeFileSync(lateOverride, Buffer.alloc(1_000_000));
-    writeFileSync(join(root, ".env"), `OPENCODEX_BUN_PATH=${JSON.stringify(lateOverride)}\nOCX_BUN_RUNTIME_SOURCE=override\nOCX_BUN_RUNTIME_PATH=${JSON.stringify(lateOverride)}\nOCX_PATH_DOTENV_LOADED=yes\n`);
+    // Bun dotenv preserves backslashes in single quotes; JSON quoting doubles Windows separators.
+    writeFileSync(join(root, ".env"), `OPENCODEX_BUN_PATH='${lateOverride}'\nOCX_BUN_RUNTIME_SOURCE=override\nOCX_BUN_RUNTIME_PATH='${lateOverride}'\nOCX_PATH_DOTENV_LOADED=yes\n`);
     const script = join(root, "consumer.ts");
     writeFileSync(script, `import {durableBunRuntime,reportedBunRuntimeSource} from ${JSON.stringify(repoPath("src/lib/bun-runtime.ts"))};\nconsole.log(JSON.stringify({runtime:durableBunRuntime(),reported:reportedBunRuntimeSource(),dotenv:process.env.OCX_PATH_DOTENV_LOADED,override:process.env.OPENCODEX_BUN_PATH}));`);
     const result = spawnSync(selected!.path, [script], {
