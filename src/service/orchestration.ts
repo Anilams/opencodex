@@ -350,7 +350,6 @@ export async function installFreshWindowsSchedulerSafely(
   const configDir = (deps.configDir ?? getConfigDir)();
   const configRootWasAbsent = !existsSync(configDir);
   const runtime = Object.freeze({ ...(deps.selectRuntime ?? durableBunRuntime)() });
-  (deps.assertRuntimeWritable ?? assertSelectedRuntimeWritable)(runtime, configDir, { platform: deps.platform, rootWasAbsent: configRootWasAbsent });
   let registered = false;
   let started = false;
   try {
@@ -370,6 +369,7 @@ export async function installFreshWindowsSchedulerSafely(
         + "aborting before service-manager cleanup or asset publication.",
       );
     }
+    (deps.assertRuntimeWritable ?? assertSelectedRuntimeWritable)(runtime, configDir, { platform: deps.platform, rootWasAbsent: false });
     await prepare();
     removeNativeService();
     publishAssets(runtime);
