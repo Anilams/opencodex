@@ -140,9 +140,9 @@ repair compares the full plist after normalizing its previous PATH: a PATH clean
 definition change reloads the live job through the guarded eviction and bootstrap path.
 
 Launcher mode omits the package-local Bun provenance pair because an upgrade may delete that
-versioned tree. The only runtime path carried through the launcher is a pre-Bun, proof-bound
-`OPENCODEX_BUN_PATH` whose durable runtime source is `override`; bundled and process fallbacks are
-rediscovered by the current launcher. The API-auth token remains file-backed and is loaded only by
+versioned tree. Only a pre-Bun, proof-bound `OPENCODEX_BUN_PATH` with durable source `override` is
+carried through; `bin/ocx.mjs` rediscovers bundled or validated PATH Bun, stamping PATH selection as
+`process` via `src/lib/bun-path-runtime.mjs`. The API-auth token remains file-backed and is loaded only by
 the service shell at start. On macOS, `start` and detailed `status` compare the live launchd job
 against `expectedLaunchdCommand`, which still follows a `launcherPath` recorded by a pre-pinning
 install rather than re-walking PATH, so such a job is never misreported as an older plist (#3464).
