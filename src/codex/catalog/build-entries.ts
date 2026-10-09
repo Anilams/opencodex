@@ -853,11 +853,14 @@ export function mergeCatalogEntriesFromObservedState({
     }
     return false;
   });
-  const operatorRows = new Map(detachedCatalogModels.flatMap(entry =>
-    typeof entry.slug === "string" && trustedAccountBoundNativeCatalogSlug(entry) === undefined
-      && !isNativeAliasCatalogEntry(entry) && entry.owned_by !== COMBO_NAMESPACE
-      ? [[entry.slug, entry] as const] : []
-  ));
+  // First occurrence wins, matching enforceCatalogSlugUniqueness: a later duplicate row of the
+  // same slug is what the writer drops, so it must not decide which declaration survives.
+  const operatorRows = new Map<string, RawEntry | undefined>();
+  for (const entry of detachedCatalogModels) {
+    if (typeof entry.slug !== "string" || operatorRows.has(entry.slug)) continue;
+    operatorRows.set(entry.slug, trustedAccountBoundNativeCatalogSlug(entry) === undefined
+      && !isNativeAliasCatalogEntry(entry) && entry.owned_by !== COMBO_NAMESPACE ? entry : undefined);
+  }
   for (const entry of finalRoutedEntries) {
     if (typeof entry.slug !== "string" || !entry.slug.includes("/")
       || isNativeAliasCatalogEntry(entry) || isExactComboCatalogEntry(entry, exactComboSlugs)

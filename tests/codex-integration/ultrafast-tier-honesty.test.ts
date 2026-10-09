@@ -110,6 +110,12 @@ describe("operator ultrafast survives the build and merge boundary", () => {
     const malformed = row(merge([{ slug, service_tiers: [null, {}, { id: 1 }] }]));
     expect(malformed.additional_speed_tiers).toEqual(["fast"]);
   });
+
+  test("duplicate persisted rows follow the writers' first-win slug policy", () => {
+    const stale: RawEntry = { slug, service_tiers: [{ id: "priority", name: "Fast" }], additional_speed_tiers: ["fast"] };
+    expect(row(merge([previous(), stale])).additional_speed_tiers).toEqual(["fast", "ultrafast"]);
+    expect(row(merge([stale, previous()])).additional_speed_tiers).toEqual(["fast"]);
+  });
 });
 
 for (const writer of ["retained-sync", "convergence"] as const) {
