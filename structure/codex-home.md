@@ -304,9 +304,11 @@ the selected home alias, including the default `.codex`, for drift validation. T
 validated immediately before spawning and after exit, including failed exits. Native commands
 require the held canonical destination to be the canonical child home's config.toml; a link
 to a differently named file refuses before transition staging or child writes.
-The child boundary captures exact bytes or proven absence and file identity immediately before
-spawn. Alias drift restores that preimage through the canonical path while the lock remains held;
-a multi-agent transition restores its original bytes, including edits staged before the child.
+The recovery scope captures exact bytes or proven absence and file identity before any writes.
+Standalone toggles refresh this preimage immediately before spawn; multi-agent transitions retain
+it from before staging. All later validation, publication, child failures and postconditions run
+inside that scope, including wrapper entry and the initial spawn validator. Alias drift restores
+that preimage through the canonical path while the lock remains held.
 Recovery validates the canonical file identity immediately before publication and every rename
 retry. A changed canonical target refuses recovery, preserves existing journal evidence, and
 retains a private preimage file beside the canonical config with its location in the diagnostic.

@@ -1048,3 +1048,91 @@ test("canonical dangling symlink is a changed target rather than proven absence"
   const evidence = fs.readdirSync(join(canonical, "..")).filter(name => name.startsWith("config.toml.ocx-native-preimage."));
   expect(evidence.length).toBe(1); expect(fs.readFileSync(join(canonical, "..", evidence[0]!), "utf8")).toBe("preimage");
 });
+
+for (const point of ["wrapper entry", "initial spawn validator"]) test(`transition recovers alias drift before ${point}`, async () => {
+  const fs = await import("node:fs"), { spyOn } = await import("bun:test");
+  const atomic = await import("../../src/config/atomic-write");
+  const original = Buffer.from("# exact CRLF\r\n[agents]\r\nmax_threads = 7 # children\r\n");
+  const a = fixtureConfig(original.toString()), b = fixtureConfig("model = \"B\"\n");
+  const canonical = fs.realpathSync(a), home = join(canonical, ".."), root = fs.mkdtempSync(join(tmpdir(), "ocx-staged-entry-")); roots.push(root);
+  const alias = join(root, "home"), bHome = fs.realpathSync(join(b, "..")); fs.symlinkSync(home, alias, "junction");
+  const retarget = () => { fs.unlinkSync(alias); fs.symlinkSync(bHome, alias, "junction"); };
+  const writer = atomic.atomicWriteFile, realpath = fs.realpathSync; let staged = false, homeReads = 0, children = 0;
+  const publication = spyOn(atomic, "atomicWriteFile").mockImplementation((path, content, io, hooks) => {
+    writer(path, content, io, hooks);
+    if (path === canonical && content.includes("enabled = false")) {
+      staged = true;
+      expect(content).not.toContain("max_threads =");
+      if (point === "wrapper entry") retarget();
+    }
+  });
+  const resolution = spyOn(fs, "realpathSync").mockImplementation((path, options) => {
+    const resolved = realpath(path, options);
+    // The native assertion reads the home first; environment preparation reads it
+    // again immediately before the wrapper's initial spawn validation.
+    if (point === "initial spawn validator" && staged && path === home && ++homeReads === 2) retarget();
+    return resolved;
+  });
+  try {
+    const result = transitionMultiAgentV2(true, () => { children++; }, { configPath: join(alias, "config.toml") });
+    expect(staged).toBe(true); expect(children).toBe(0);
+    expect(fs.readFileSync(a)).toEqual(original); expect(fs.readFileSync(b, "utf8")).toBe("model = \"B\"\n");
+    expect(result).toMatchObject({ ok: false, retryable: false, error: expect.stringContaining("canonical preimage restored") });
+  } finally { publication.mockRestore(); resolution.mockRestore(); }
+});
+
+for (const missing of [false, true]) test(`toggle initial spawn validator retains recovery protection (missing=${missing})`, async () => {
+  const fs = await import("node:fs"), { spyOn } = await import("bun:test");
+  const { runConfigWriteChild } = await import("../../src/codex/config-write-lock");
+  const a = fixtureConfig("original\r\n"), b = fixtureConfig("B"), canonical = fs.realpathSync(a), home = join(canonical, "..");
+  const root = fs.mkdtempSync(join(tmpdir(), "ocx-initial-validator-")); roots.push(root);
+  const alias = join(root, "home"), bHome = fs.realpathSync(join(b, "..")); fs.symlinkSync(home, alias, "junction");
+  if (missing) fs.unlinkSync(a);
+  const realpath = fs.realpathSync; let homeReads = 0, children = 0;
+  const resolution = spyOn(fs, "realpathSync").mockImplementation((path, options) => {
+    const resolved = realpath(path, options);
+    if (path === home && ++homeReads === 2) { fs.unlinkSync(alias); fs.symlinkSync(bHome, alias, "junction"); }
+    return resolved;
+  });
+  try {
+    withConfigWriteLock(join(alias, "config.toml"), held => {
+      expect(() => runConfigWriteChild(join(alias, "config.toml"), held, () => { children++; })).toThrow("canonical preimage restored");
+    });
+    expect(children).toBe(0); expect(fs.readFileSync(b, "utf8")).toBe("B");
+    if (missing) expect(fs.existsSync(a)).toBe(false); else expect(fs.readFileSync(a)).toEqual(Buffer.from("original\r\n"));
+  } finally { resolution.mockRestore(); }
+});
+
+for (const point of ["wrapper entry", "spawn revalidation"]) test(`changed canonical file before ${point} retains the original preimage`, async () => {
+  const fs = await import("node:fs"), { spyOn } = await import("bun:test");
+  const atomic = await import("../../src/config/atomic-write");
+  const original = Buffer.from("# preserve bytes\r\n[agents]\r\nmax_threads = 7\r\n");
+  const a = fixtureConfig(original.toString()), canonical = fs.realpathSync(a), writer = atomic.atomicWriteFile;
+  const replace = () => { fs.writeFileSync(a + ".replacement", "independent replacement"); fs.renameSync(a + ".replacement", a); };
+  let staged = false, children = 0;
+  const publication = spyOn(atomic, "atomicWriteFile").mockImplementation((path, content, io, hooks) => {
+    writer(path, content, io, hooks);
+    if (path === canonical && content.includes("enabled = false")) { staged = true; if (point === "wrapper entry") replace(); }
+  });
+  try {
+    const result = transitionMultiAgentV2(true, (_enabled, _env, validate) => {
+      replace(); validate(); children++;
+    }, { configPath: a });
+    expect(staged).toBe(true); expect(children).toBe(0);
+    expect(result).toMatchObject({ ok: false, retryable: false, error: expect.stringContaining("canonical preimage recovery refused") });
+    expect(fs.readFileSync(a, "utf8")).toBe("independent replacement");
+    const evidence = fs.readdirSync(join(canonical, "..")).filter(name => name.startsWith("config.toml.ocx-native-preimage."));
+    expect(evidence).toHaveLength(1); expect(fs.readFileSync(join(canonical, "..", evidence[0]!))).toEqual(original);
+  } finally { publication.mockRestore(); }
+});
+
+test("failed standalone toggle restores its exact preimage", async () => {
+  const fs = await import("node:fs"), { runConfigWriteChild } = await import("../../src/codex/config-write-lock");
+  const original = Buffer.from([0xff, 0x0d, 0x0a, 0x00]), a = fixtureConfig(""); fs.writeFileSync(a, original);
+  withConfigWriteLock(a, held => {
+    expect(() => runConfigWriteChild(a, held, env => {
+      fs.writeFileSync(join(env.CODEX_HOME!, "config.toml"), "partial toggle"); throw new Error("child failed");
+    })).toThrow("child failed");
+    expect(fs.readFileSync(a)).toEqual(original);
+  });
+});

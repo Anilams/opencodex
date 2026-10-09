@@ -37,7 +37,7 @@ import { createRequire } from "node:module";
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { AtomicWriteResidualTempError, AtomicWriteSecretResidualError, atomicWriteFile, getConfigDir } from "../config";
-import { ConfigWriteDestinationChanged, assertNativeConfigWriteDestination, runConfigWriteChild, publishConfigWrite, configWriteLockFailureMessage, withConfigWriteLock, withConfigWriteLockHeld, type LockHandle } from "./config-write-lock";
+import { ConfigWriteDestinationChanged, assertNativeConfigWriteDestination, runConfigWriteChild, withConfigWriteRecovery, publishConfigWrite, configWriteLockFailureMessage, withConfigWriteLock, withConfigWriteLockHeld, type LockHandle } from "./config-write-lock";
 import { forgetEphemeralSecretPath } from "../lib/windows-secret-acl";
 import { resolveCodexHomeDir } from "./home";
 import { resolveAndPersistCodexRuntime } from "./runtime";
@@ -1547,7 +1547,6 @@ export function transitionMultiAgentV2(
   const runTransition = (held: LockHandle): MultiAgentV2TransitionResult => {
   const original = readConfigText(path);
   if (original === null) return { ok: false, error: `config.toml not readable at ${path}` };
-  const originalBytes = readFileSync(path);
   const preflightError = transitionConfigError(original);
   if (preflightError) return { ok: false, error: preflightError };
   const beforeEnabled = isMultiAgentV2Enabled(path);
@@ -1573,48 +1572,45 @@ export function transitionMultiAgentV2(
   }
   const migratedComment = activeThreadComment(original, beforeEnabled);
   try {
-    if (beforeEnabled !== enabled) assertNativeConfigWriteDestination(path, held);
-    if (enabled) {
-      if (!beforeEnabled) {
-        const staged = applyConfigEditsAtomically(path, held, tempPath => {
-          const v2 = ensureDisabledV2Config(threadLimit, tempPath, migratedComment);
+    return withConfigWriteRecovery(path, held, () => {
+      if (beforeEnabled !== enabled) assertNativeConfigWriteDestination(path, held);
+      if (enabled) {
+        if (!beforeEnabled) {
+          const staged = applyConfigEditsAtomically(path, held, tempPath => {
+            const v2 = ensureDisabledV2Config(threadLimit, tempPath, migratedComment);
+            if (!v2.ok) return v2;
+            return editAgentsMaxThreads(null, tempPath);
+          });
+          if (!staged.ok) throw new Error(staged.error);
+          runConfigWriteChild(path, held, (env, validate) => toggleFeature(true, env, validate));
+        }
+        if (!isMultiAgentV2Enabled(path)) throw new Error("codex feature command did not enable multi_agent_v2");
+        const target = applyConfigEditsAtomically(path, held, tempPath => {
+          const v2 = threadLimit === null
+            ? removeMaxConcurrentThreads(tempPath)
+            : setMaxConcurrentThreads(threadLimit, tempPath, migratedComment);
           if (!v2.ok) return v2;
           return editAgentsMaxThreads(null, tempPath);
         });
-        if (!staged.ok) throw new Error(staged.error);
-        runConfigWriteChild(path, held, (env, validate) => toggleFeature(true, env, validate), originalBytes);
+        if (!target.ok) throw new Error(target.error);
+        if (hasAgentsMaxThreads(path) || getMaxConcurrentThreads(path) !== threadLimit) throw new Error("v2 thread-limit migration postcondition failed");
+      } else {
+        if (beforeEnabled) runConfigWriteChild(path, held, (env, validate) => toggleFeature(false, env, validate));
+        if (isMultiAgentV2Enabled(path)) throw new Error("codex feature command did not disable multi_agent_v2");
+        const target = applyConfigEditsAtomically(path, held, tempPath => {
+          const v2 = removeMaxConcurrentThreads(tempPath);
+          if (!v2.ok) return v2;
+          return editAgentsMaxThreads(threadLimit, tempPath, migratedComment);
+        });
+        if (!target.ok) throw new Error(target.error);
+        if (getMaxConcurrentThreads(path) !== null || getAgentsMaxThreads(path) !== threadLimit) throw new Error("v1 thread-limit migration postcondition failed");
       }
-      if (!isMultiAgentV2Enabled(path)) throw new Error("codex feature command did not enable multi_agent_v2");
-      const target = applyConfigEditsAtomically(path, held, tempPath => {
-        const v2 = threadLimit === null
-          ? removeMaxConcurrentThreads(tempPath)
-          : setMaxConcurrentThreads(threadLimit, tempPath, migratedComment);
-        if (!v2.ok) return v2;
-        return editAgentsMaxThreads(null, tempPath);
-      });
-      if (!target.ok) throw new Error(target.error);
-      if (hasAgentsMaxThreads(path) || getMaxConcurrentThreads(path) !== threadLimit) throw new Error("v2 thread-limit migration postcondition failed");
-    } else {
-      if (beforeEnabled) runConfigWriteChild(path, held, (env, validate) => toggleFeature(false, env, validate), originalBytes);
-      if (isMultiAgentV2Enabled(path)) throw new Error("codex feature command did not disable multi_agent_v2");
-      const target = applyConfigEditsAtomically(path, held, tempPath => {
-        const v2 = removeMaxConcurrentThreads(tempPath);
-        if (!v2.ok) return v2;
-        return editAgentsMaxThreads(threadLimit, tempPath, migratedComment);
-      });
-      if (!target.ok) throw new Error(target.error);
-      if (getMaxConcurrentThreads(path) !== null || getAgentsMaxThreads(path) !== threadLimit) throw new Error("v1 thread-limit migration postcondition failed");
-    }
-    return { ok: true, changed: readConfigText(path) !== original, threadLimit };
+      return { ok: true, changed: readConfigText(path) !== original, threadLimit };
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (err instanceof ConfigWriteDestinationChanged) return { ok: false, error: message, retryable: false };
-    try {
-      publishConfigWrite(path, held, (destination, hooks) => atomicWriteFile(destination, original, undefined, hooks));
-      return { ok: false, error: message };
-    } catch (rollbackErr) {
-      return { ok: false, error: `${message}; rollback failed: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}` };
-    }
+    return { ok: false, error: message };
   }
   };
   /*

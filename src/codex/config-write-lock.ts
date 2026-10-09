@@ -47,6 +47,13 @@ import { release, stillHeld, tryAcquire, type AcquireResult, type LockHandle } f
 
 interface Destination { canonical: string; inode: string | null }
 const destinations = new WeakMap<LockHandle, Destination>();
+interface ConfigWriteRecovery {
+  canonical: string;
+  preimage: Buffer | null;
+  identity: string | null;
+  refreshBeforeSpawn: boolean;
+}
+const recoveries = new WeakMap<LockHandle, ConfigWriteRecovery>();
 function destination(path: string): Destination {
   const absolute = resolve(path);
   let canonical: string;
@@ -105,6 +112,8 @@ export function publishConfigWrite<T>(configPath: string, held: LockHandle, run:
   return run(canonical, {
     validateBeforeRename: () => { assertConfigWriteDestination(configPath, held); },
     afterRename: () => {
+      const recovery = recoveries.get(held);
+      if (recovery?.canonical === canonical) recovery.identity = canonicalFileIdentity(canonical);
       const after = destination(configPath);
       if (!stillHeld(held) || after.canonical !== canonical) throw new Error("Codex configuration destination changed; recovery evidence was preserved.");
       destinations.set(held, after);
@@ -141,62 +150,93 @@ function canonicalFileIdentity(canonical: string): string | null {
   if (!stat.isFile() || `${stat.dev}:${stat.ino}` !== current.inode) throw new Error("canonical configuration target is not the observed regular file");
   return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
 }
+/** Capture before the first write; nested native children share the same recovery scope. */
+export function withConfigWriteRecovery<T>(
+  configPath: string, held: LockHandle, run: () => T,
+  options: { refreshBeforeSpawn?: boolean; preimage?: Buffer } = {},
+): T {
+  if (recoveries.has(held)) return run();
+  let canonical: string;
+  try { canonical = assertConfigWriteDestination(configPath, held); }
+  catch { throw new ConfigWriteDestinationChanged(); }
+  const identity = canonicalFileIdentity(canonical);
+  const preimage = identity === null ? null : readFileSync(canonical);
+  if (canonicalFileIdentity(canonical) !== identity) throw new ConfigWriteDestinationChanged();
+  const recovery: ConfigWriteRecovery = {
+    canonical, identity, preimage: options.preimage ?? preimage,
+    refreshBeforeSpawn: options.refreshBeforeSpawn === true && options.preimage === undefined,
+  };
+  recoveries.set(held, recovery);
+  try {
+    const value = run();
+    assertConfigWriteDestination(configPath, held);
+    return value;
+  } catch (error) {
+    let changed = error instanceof ConfigWriteDestinationChanged;
+    try { assertConfigWriteDestination(configPath, held); } catch { changed = true; }
+    try {
+      const validateRecovery = (targetPath = canonical) => {
+        if (targetPath !== canonical || !stillHeld(held) || held.path !== `${canonical}.ocx-write.lock`
+          || canonicalFileIdentity(canonical) !== recovery.identity) {
+          throw new Error("canonical configuration target changed before recovery");
+        }
+      };
+      validateRecovery();
+      // A pre-write refusal leaves the original entry intact, including its inode.
+      const unchanged = recovery.identity === identity && (recovery.preimage === preimage
+        || (recovery.preimage !== null && preimage !== null && recovery.preimage.equals(preimage)));
+      if (!unchanged) {
+        if (recovery.preimage === null) { validateRecovery(); if (recovery.identity !== null) unlinkSync(canonical); }
+        else atomicWriteFileStreamed(canonical, fd => writeFileSync(fd, recovery.preimage!), { validateBeforeRename: validateRecovery });
+      }
+      destinations.set(held, destination(canonical));
+    } catch (recoveryError) {
+      let evidence = "recovery evidence could not be persisted";
+      try {
+        const recoveryPath = `${canonical}.ocx-native-preimage.${randomUUID()}`;
+        atomicWriteFileStreamed(recoveryPath, fd => writeFileSync(fd, recovery.preimage ?? Buffer.from('{"preimage":"absent"}\n')));
+        evidence = `recovery evidence retained at ${recoveryPath}`;
+      } catch { /* Preserve the refusal and diagnostic even when evidence storage fails. */ }
+      throw new ConfigWriteDestinationChanged(`Codex configuration destination changed; canonical preimage recovery refused: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}; ${evidence}.`);
+    }
+    if (changed) throw new ConfigWriteDestinationChanged(`${error instanceof Error ? error.message : String(error)}; canonical preimage restored and recovery evidence preserved.`);
+    throw error;
+  } finally { recoveries.delete(held); }
+}
 export function runConfigWriteChild(
   configPath: string, held: LockHandle,
   run: (env: NodeJS.ProcessEnv, validateBeforeSpawn: () => void) => void,
   transitionPreimage?: Buffer,
 ): void {
-  const canonical = assertNativeConfigWriteDestination(configPath, held);
-  let preimage: Buffer | null = null, captured = false;
-  const validateBeforeSpawn = () => {
-    assertNativeConfigWriteDestination(configPath, held);
-    const identity = canonicalFileIdentity(canonical);
-    const bytes = identity === null ? null : readFileSync(canonical);
-    if (canonicalFileIdentity(canonical) !== identity) throw new ConfigWriteDestinationChanged();
-    preimage = transitionPreimage ?? bytes;
-    captured = true;
-  };
-  publishConfigWrite(configPath, held, (_canonical, hooks) => {
-    const env = { ...process.env };
-    // Windows env names are case-insensitive; wrappers may honor Orca's override.
-    for (const key of Object.keys(env)) {
-      if (["CODEX_HOME", "ORCA_CODEX_HOME"].includes(key.toUpperCase())) delete env[key];
-    }
-    env.CODEX_HOME = realpathSync(dirname(canonical));
-    validateBeforeSpawn();
-    try { run(env, validateBeforeSpawn); }
-    // Even a failed child can have replaced config.toml. Check before rollback.
-    finally {
-      let childIdentity: string | null | undefined;
-      try {
-        childIdentity = canonicalFileIdentity(canonical);
-        hooks.afterRename?.(canonical);
-      } catch {
-        try {
-          const validateRecovery = (targetPath = canonical) => {
-            if (targetPath !== canonical || !captured || childIdentity === undefined || !stillHeld(held)
-              || held.path !== `${canonical}.ocx-write.lock`
-              || canonicalFileIdentity(canonical) !== childIdentity) {
-              throw new Error("canonical configuration target changed before recovery");
-            }
-          };
-          validateRecovery();
-          if (preimage === null) { validateRecovery(); if (childIdentity !== null) unlinkSync(canonical); }
-          else atomicWriteFileStreamed(canonical, fd => writeFileSync(fd, preimage!), { validateBeforeRename: validateRecovery });
-          destinations.set(held, destination(canonical));
-        } catch (recoveryError) {
-          let evidence = "recovery evidence could not be persisted";
-          try {
-            const recoveryPath = `${canonical}.ocx-native-preimage.${randomUUID()}`;
-            atomicWriteFileStreamed(recoveryPath, fd => writeFileSync(fd, preimage ?? Buffer.from('{"preimage":"absent"}\n')));
-            evidence = `recovery evidence retained at ${recoveryPath}`;
-          } catch { /* Preserve the refusal and diagnostic even when evidence storage fails. */ }
-          throw new ConfigWriteDestinationChanged(`Codex configuration destination changed; canonical preimage recovery refused: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}; ${evidence}.`);
-        }
-        throw new ConfigWriteDestinationChanged("Codex configuration destination changed; canonical preimage restored and recovery evidence preserved.");
+  withConfigWriteRecovery(configPath, held, () => {
+    const canonical = assertNativeConfigWriteDestination(configPath, held);
+    const recovery = recoveries.get(held)!;
+    let readyToSpawn = false;
+    const validateBeforeSpawn = () => {
+      readyToSpawn = false;
+      assertNativeConfigWriteDestination(configPath, held);
+      const identity = canonicalFileIdentity(canonical);
+      const bytes = identity === null ? null : readFileSync(canonical);
+      if (canonicalFileIdentity(canonical) !== identity) throw new ConfigWriteDestinationChanged();
+      if (recovery.refreshBeforeSpawn) { recovery.preimage = bytes; recovery.identity = identity; }
+      readyToSpawn = true;
+    };
+    publishConfigWrite(configPath, held, (_canonical, hooks) => {
+      const env = { ...process.env };
+      // Windows env names are case-insensitive; wrappers may honor Orca's override.
+      for (const key of Object.keys(env)) {
+        if (["CODEX_HOME", "ORCA_CODEX_HOME"].includes(key.toUpperCase())) delete env[key];
       }
-    }
-  });
+      env.CODEX_HOME = realpathSync(dirname(canonical));
+      validateBeforeSpawn();
+      try { run(env, validateBeforeSpawn); }
+      // Even a failed child can replace config.toml. Observe only after it entered.
+      finally {
+        try { if (readyToSpawn) hooks.afterRename?.(canonical); }
+        catch { throw new ConfigWriteDestinationChanged(); }
+      }
+    });
+  }, { refreshBeforeSpawn: true, preimage: transitionPreimage });
 }
 export function withConfigWriteLockHeld<T>(
   configPath: string, held: LockHandle | undefined, run: (handle: LockHandle) => T,
