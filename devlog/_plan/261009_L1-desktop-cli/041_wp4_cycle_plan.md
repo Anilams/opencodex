@@ -17,3 +17,11 @@ Deliverables (B):
 Check (C): both PRs' required checks green at their exact heads (`gh pr checks`), recorded with run ids.
 Out of scope: merging, other lanes, PR B.
 
+
+Audit (reviewer 01a11e4b): GO-WITH-FIXES (blockers=1), folded:
+- Review evidence is recorded here for A and C: #6802 independent review PASS (round 3, reviewer 01a11e61, head
+  e866bf0815 → rebased 1718fcad8b, content-identical); #6807 independent review PASS (reviewer 01a11e61, head 73f166f08a).
+  PR B's review and the three-PR reconciliation transfer to wp5's C/D.
+- 039 now exists on this branch too (copied from the launcher branch; identical content).
+- The macos 1/2 failure is retried as a whole failed job after the run completes; a repeat in the same batch is
+  treated as real and investigated, not retried again.
