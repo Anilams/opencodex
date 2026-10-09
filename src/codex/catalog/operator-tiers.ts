@@ -1,9 +1,11 @@
 import type { RawEntry } from "./parsing";
 
+/** Match the opt-in tier spelling without coercing malformed catalog values to strings. */
 function isUltraFast(value: unknown): boolean {
   return typeof value === "string" && value.trim().toLowerCase() === "ultrafast";
 }
 
+/** Recognize an explicitly supplied Ultra Fast descriptor by its string-valued id. */
 function isUltraFastDescriptor(value: unknown): boolean {
   return value !== null && typeof value === "object" && "id" in value && isUltraFast(value.id);
 }
