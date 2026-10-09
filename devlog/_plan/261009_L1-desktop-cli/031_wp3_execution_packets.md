@@ -25,3 +25,8 @@ Reflection (Pascal): MISALIGNED → folded: main's verifier also runs `tests/cli
 `tests/cli/cli-ready.test.ts`, `tests/cli/cli-ready-subprocess.test.ts`, `tests/cli/cli-resolve.test.ts`,
 `tests/cli/cli-resolve-subprocess.test.ts` (030:1076). Combined-tree check (030 r4): main merges PR B's and PR C's
 branches into a scratch branch before the later PR's last push and runs ocx-launcher-source + ocx-launcher-runtime there.
+
+Audit (reviewer 01a11e4b): GO-WITH-FIXES (blockers=1), folded: the Node reproduction runs with a child-only
+environment — `BUN_RUNTIME_TRANSPILER_CACHE_PATH=0`, `OPENCODEX_HOME`/`CODEX_HOME`/`HOME`-derived caches pointed at the
+temp fixture, `OPENCODEX_BUN_PATH` unset, PATH = the user's Bun directory plus system dirs (child only), and the temp
+package copy keeps every installed dependency except `node_modules/bun` so nothing installs during the run.
