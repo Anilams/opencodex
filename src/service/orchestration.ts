@@ -1,5 +1,7 @@
 import { findLiveProxy, SERVICE_STOP_LIVENESS } from "../server/proxy-liveness";
 import { existsSync, unlinkSync } from "node:fs";
+import { durableBunRuntime, type DurableBunRuntime } from "../lib/bun-runtime";
+import { assertSelectedRuntimeWritable, type RuntimePreflightDeps } from "../lib/bun-runtime-preflight";
 import { getConfigDir } from "../config";
 import { readPid, removePid, removeRuntimePort, verifyPidIdentity } from "../config/process-state";
 import { isWslRuntime } from "../codex/home";
@@ -14,7 +16,7 @@ import { assertSchedulerRegistrationBeforeStart } from "./repair";
 import { SERVICE_MANAGED_ENV, TASK, plistPath, removeServiceInstallStateRecords, writeServiceInstallState } from "./state";
 import type { ServiceBackend } from "./state";
 import { unitPath, isSystemd, installSystemd, startSystemd, stopSystemd, statusSystemd, uninstallSystemd, systemdServiceInstallCleanupOps } from "./systemd";
-import { writeWindowsSchedulerAssets, stageWindowsSchedulerRegistrationXml, removeWindowsSchedulerRegistrationStage, registerFreshWindowsSchedulerTask, recordWindowsSchedulerOwnership, removeNativeWindowsServiceForScheduler, installWindows, installWindowsNative, startWindows, isWindowsSchedulerEndBenign, stopWindows, stopWindowsChecked, statusWindows, statusWindowsXml, killWindowsServiceWrapperProcesses, uninstallWindows, classifyWindowsServiceStop } from "./windows-ops";
+import { writeWindowsSchedulerAssets, stageWindowsSchedulerRegistrationXml, removeWindowsSchedulerRegistrationStage, registerFreshWindowsSchedulerTask, recordWindowsSchedulerOwnership, removeNativeWindowsServiceForScheduler, commitWindowsInstall, commitWindowsNativeInstall, type WindowsServiceInstallDeps, startWindows, isWindowsSchedulerEndBenign, stopWindows, stopWindowsChecked, statusWindows, statusWindowsXml, killWindowsServiceWrapperProcesses, uninstallWindows, classifyWindowsServiceStop } from "./windows-ops";
 import { schtasks, probeWindowsSchedulerTask, rollbackWindowsSchedulerTaskOwnedByAttempt, settleDelay } from "./windows-scheduler";
 import type { WindowsSchedulerTaskProbe } from "./windows-scheduler";
 import { windowsTaskRegistrationOwnedByAttempt, windowsTaskRegistrationHealthy } from "./windows-taskxml";
@@ -23,7 +25,7 @@ import { launchdGuiDomain } from "./launchd";
 import { LABEL } from "./state";
 
 type ServiceOps = {
-  install: () => void | Promise<void>; start: () => void; stop: () => void;
+  install: (runtime: DurableBunRuntime) => void | Promise<void>; start: () => void; stop: () => void;
   status: () => string; uninstall: () => void;
 };
 
@@ -32,18 +34,19 @@ export type ServiceInstallCleanupOps = {
   stop: () => void;
 };
 
-export function platformOps(backend: ServiceBackend = "scheduler"): ServiceOps | null {
-  if (process.platform === "darwin")
+export function platformOps(backend: ServiceBackend = "scheduler", deps: { platform?: NodeJS.Platform; windowsInstall?: WindowsServiceInstallDeps } = {}): ServiceOps | null {
+  const platform = deps.platform ?? process.platform;
+  if (platform === "darwin")
     // Wrapped, not passed: `installLaunchd` reports whether it reloaded launchd, and only
     // `repairService` (for the `restart` verb) has any use for that. `ServiceOps.install` is
     // the generic install seam and deliberately promises nothing about a return value.
     return { install: () => { installLaunchd(); }, start: startLaunchd, stop: stopLaunchd, status: statusLaunchd, uninstall: uninstallLaunchd };
-  if (process.platform === "win32") {
+  if (platform === "win32") {
     if (backend === "native")
-      return { install: installWindowsNative, start: startWinswService, stop: stopWinswService, status: winswStatusSummary, uninstall: uninstallWinswService };
-    return { install: installWindows, start: startWindows, stop: stopWindows, status: statusWindows, uninstall: uninstallWindows };
+      return { install: runtime => commitWindowsNativeInstall(runtime, deps.windowsInstall), start: startWinswService, stop: stopWinswService, status: winswStatusSummary, uninstall: uninstallWinswService };
+    return { install: runtime => commitWindowsInstall(runtime, deps.windowsInstall), start: startWindows, stop: stopWindows, status: statusWindows, uninstall: uninstallWindows };
   }
-  if (process.platform === "linux") {
+  if (platform === "linux") {
     if (existsSync("/.dockerenv")) {
       console.error("Docker detected. Run 'ocx start' directly instead of using the service manager.");
       process.exit(1);
@@ -229,7 +232,7 @@ export async function stopTrackedProxyForServiceCommand(): Promise<TrackedProxyC
   }
 }
 
-export interface ServiceInstallPreparationDeps {
+export interface ServiceInstallPreparationDeps extends RuntimePreflightDeps {
   diagnose?: () => ServiceDiagnostic;
   managerOps?: (backend: ServiceBackend) => ServiceInstallCleanupOps | null;
   stopTrackedProxy?: () => Promise<unknown>;
@@ -276,27 +279,30 @@ export async function prepareServiceInstall(
 
 export async function installServiceSafely(
   requestedBackend: ServiceBackend,
-  install: () => void | Promise<void>,
+  install: (runtime: DurableBunRuntime) => void | Promise<void>,
   deps: ServiceInstallPreparationDeps = {},
 ): Promise<void> {
+  const runtime = Object.freeze({ ...(deps.selectRuntime ?? durableBunRuntime)() });
+  const configDir = (deps.configDir ?? getConfigDir)();
+  (deps.assertRuntimeWritable ?? assertSelectedRuntimeWritable)(runtime, configDir, { platform: deps.platform, rootWasAbsent: !existsSync(configDir) });
   await prepareServiceInstall(requestedBackend, deps);
-  await install();
+  await install(runtime);
 }
 
-export interface FreshWindowsSchedulerInstallDeps {
+export interface FreshWindowsSchedulerInstallDeps extends RuntimePreflightDeps {
   stageRegistrationXml?: (attemptNonce: string) => string;
   register?: (xmlPath: string, attemptNonce: string) => Promise<void>;
   recordOwnership?: () => boolean;
   prepare?: () => Promise<void>;
   removeNativeService?: () => void;
-  publishAssets?: () => void;
+  publishAssets?: (runtime: DurableBunRuntime) => void;
   verifyBeforeRun?: (attemptNonce: string) => void | Promise<void>;
   /** Reads the newly registered task; empty or throwing reads are retried before rollback. */
   readSchedulerXml?: () => string;
   /** Bounded wait before retrying an unreadable fresh-install registration. */
   settleSchedulerRead?: (delayMs: number) => void | Promise<void>;
   runTask?: () => void;
-  writeState?: () => void;
+  writeState?: (runtime: DurableBunRuntime) => void;
   rollbackTask?: (attemptNonce: string) => Promise<string | null>;
   removeStagedXml?: (xmlPath: string) => void;
 }
@@ -331,7 +337,7 @@ export async function installFreshWindowsSchedulerSafely(
     )
   ));
   const runTask = deps.runTask ?? startWindows;
-  const writeState = deps.writeState ?? (() => writeServiceInstallState("scheduler"));
+  const writeState = deps.writeState ?? ((runtime: DurableBunRuntime) => writeServiceInstallState("scheduler", undefined, {}, runtime));
   const rollbackTask = deps.rollbackTask ?? ((attemptNonce: string) => (
     rollbackWindowsSchedulerTaskOwnedByAttempt(attemptNonce, TASK)
   ));
@@ -341,7 +347,10 @@ export async function installFreshWindowsSchedulerSafely(
 
   let stagedXml: string | null = null;
   const attemptNonce = randomUUID();
-  const configRootWasAbsent = !existsSync(getConfigDir());
+  const configDir = (deps.configDir ?? getConfigDir)();
+  const configRootWasAbsent = !existsSync(configDir);
+  const runtime = Object.freeze({ ...(deps.selectRuntime ?? durableBunRuntime)() });
+  (deps.assertRuntimeWritable ?? assertSelectedRuntimeWritable)(runtime, configDir, { platform: deps.platform, rootWasAbsent: configRootWasAbsent });
   let registered = false;
   let started = false;
   try {
@@ -363,11 +372,11 @@ export async function installFreshWindowsSchedulerSafely(
     }
     await prepare();
     removeNativeService();
-    publishAssets();
+    publishAssets(runtime);
     await verifyBeforeRun(attemptNonce);
     runTask();
     started = true;
-    writeState();
+    writeState(runtime);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     if (registered && !started) {
