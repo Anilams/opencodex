@@ -695,8 +695,12 @@ describe("native feature children stay bound to the held home", () => {
       const aliasRoot = fs.mkdtempSync(join(tmpdir(), "ocx-child-alias-")); roots.push(aliasRoot);
       const alias = join(aliasRoot, "home"), canonicalA = fs.realpathSync(join(a, ".."));
       fs.symlinkSync(canonicalA, alias, "junction");
-      const previous = { CODEX_HOME: process.env.CODEX_HOME, ORCA_CODEX_HOME: process.env.ORCA_CODEX_HOME, Codex_Home: process.env.Codex_Home };
-      process.env.CODEX_HOME = alias; process.env.ORCA_CODEX_HOME = join(b, ".."); process.env.Codex_Home = join(b, "..");
+      // Windows treats Codex_Home as CODEX_HOME; setting it there would replace A with B.
+      const caseSensitiveEnv = process.platform !== "win32";
+      const previous = { CODEX_HOME: process.env.CODEX_HOME, ORCA_CODEX_HOME: process.env.ORCA_CODEX_HOME,
+        ...(caseSensitiveEnv ? { Codex_Home: process.env.Codex_Home } : {}) };
+      process.env.CODEX_HOME = alias; process.env.ORCA_CODEX_HOME = join(b, "..");
+      if (caseSensitiveEnv) process.env.Codex_Home = join(b, "..");
       let received: NodeJS.ProcessEnv | undefined, lockedAtSpawn = false, converged = false;
       const childBytes = route === "v2" ? original.replace("enabled = true", "enabled = false") : original.replace("= false", "= true");
       const fakeChild = (_enabled: boolean, env: NodeJS.ProcessEnv) => {
@@ -718,7 +722,8 @@ describe("native feature children stay bound to the held home", () => {
           createManagementConvergeCodex: catalogConvergenceFactory(() => { converged = true; }),
         });
         expect(received?.CODEX_HOME, JSON.stringify(await response?.clone().json())).toBe(canonicalA);
-        expect(received?.ORCA_CODEX_HOME).toBeUndefined(); expect(received?.Codex_Home).toBeUndefined();
+        expect(received?.ORCA_CODEX_HOME).toBeUndefined();
+        if (caseSensitiveEnv) expect(received?.Codex_Home).toBeUndefined();
         expect(lockedAtSpawn).toBe(true);
         expect(response?.status).toBe(502);
         expect(await response?.json()).toMatchObject({ retryable: false, error: expect.stringContaining("destination changed") });
@@ -825,6 +830,9 @@ test("injector restores canonical preimage on non-retryable child drift without 
   const a = fixtureConfig(original), b = fixtureConfig(original), root = fs.mkdtempSync(join(tmpdir(), "ocx-inject-child-"));
   roots.push(root); const alias = join(root, "home"), canonicalA = fs.realpathSync(join(a, ".."));
   fs.symlinkSync(canonicalA, alias, "junction");
+  // A differently cased inherited key can override the explicit alias in a Windows child.
+  const childEnv = { ...process.env };
+  for (const key of Object.keys(childEnv)) if (key.toUpperCase() === "CODEX_HOME") delete childEnv[key];
   const child = Bun.spawnSync([process.execPath, "-e", `
     const fs=require('node:fs'),path=require('node:path'),{spyOn}=require('bun:test');
     const eligibility=require('./src/codex/inject-coordination');
@@ -838,12 +846,13 @@ test("injector restores canonical preimage on non-retryable child drift without 
     });
     try{
       const result=await require('./src/codex/inject').injectCodexConfig(20201,{providers:[],multiAgentMode:'v1'},{lockTimeoutMs:0});
-      console.log(JSON.stringify({result,received,profile:fs.existsSync(path.join(received,'opencodex.config.toml')),journal:fs.existsSync(path.join(received,'opencodex-journal.json'))}));
+      const home=received??${JSON.stringify(canonicalA)};
+      console.log(JSON.stringify({result,received:received??null,effectiveHome:require('./src/codex/paths').CODEX_HOME,profile:fs.existsSync(path.join(home,'opencodex.config.toml')),journal:fs.existsSync(path.join(home,'opencodex-journal.json'))}));
     }finally{spy.mockRestore();setCodexMultiAgentV2ToggleForTests(undefined);}
-  `], { cwd: repoRoot(), env: { ...process.env, CODEX_HOME: alias, OPENCODEX_HOME: join(root, ".ocx-fixture"), FIXTURE_B: fs.realpathSync(join(b, "..")) }, stdout: "pipe", stderr: "pipe" });
+  `], { cwd: repoRoot(), env: { ...childEnv, CODEX_HOME: alias, OPENCODEX_HOME: join(root, ".ocx-fixture"), FIXTURE_B: fs.realpathSync(join(b, "..")) }, stdout: "pipe", stderr: "pipe" });
   expect(child.exitCode, child.stderr.toString()).toBe(0);
   const output = JSON.parse(child.stdout.toString().trim().split("\n").at(-1)!);
-  expect(output.received).toBe(canonicalA);
+  expect(output.received, JSON.stringify(output)).toBe(canonicalA);
   expect(output.result).toMatchObject({ success: false, retryable: false, message: expect.stringContaining("destination changed") });
   expect(output.profile).toBe(false); expect(output.journal).toBe(false);
   expect(fs.readFileSync(a, "utf8")).toBe(original);
