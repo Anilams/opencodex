@@ -37,6 +37,9 @@ export type ReplacePublisher =
   | "storage-cleanup"
   | "tray";
 
+/** Called immediately before every rename attempt, including each Windows retry. */
+export interface RenameValidationHooks { validateBeforeRename?: (destination: string) => void }
+
 /** The Windows error codes this module treats as a momentary hold. */
 export type ReplaceRetryCode = "EBUSY" | "EPERM" | "EACCES";
 
@@ -115,10 +118,10 @@ export function renameAtomicFile(
     sleep: Bun.sleepSync,
   },
   publisher: ReplacePublisher = "config",
-  validateBeforeRename?: (destination: string) => void,
+  hooks: RenameValidationHooks = {},
 ): void {
   for (let attempt = 0; ; attempt += 1) {
-    validateBeforeRename?.(destination);
+    hooks.validateBeforeRename?.(destination);
     try {
       io.rename(source, destination);
       return;
@@ -139,10 +142,10 @@ export async function renameAtomicFileAsync(
   source: string,
   destination: string,
   publisher: ReplacePublisher = "config",
-  validateBeforeRename?: (destination: string) => void,
+  hooks: RenameValidationHooks = {},
 ): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
-    validateBeforeRename?.(destination);
+    hooks.validateBeforeRename?.(destination);
     try {
       renameSync(source, destination);
       return;

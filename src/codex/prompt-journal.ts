@@ -86,7 +86,7 @@ export function durableWrite(path: string, content: string, hooks: AtomicWriteHo
     // still holds the target; the shared helper retries that briefly. Losing
     // this publish breaks journal restore, so it should not fail on a blink.
     hooks.beforeRename?.(tmp, path);
-    renameAtomicFile(tmp, path, undefined, "prompt-journal", hooks.validateBeforeRename);
+    renameAtomicFile(tmp, path, undefined, "prompt-journal", hooks);
     hooks.afterRename?.(path);
     // The temp is renamed away: proven absent — release its ACL memos.
     forgetEphemeralSecretPath(tmp);
