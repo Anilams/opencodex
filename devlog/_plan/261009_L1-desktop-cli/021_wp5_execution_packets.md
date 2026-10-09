@@ -36,3 +36,12 @@ Audit (reviewer 01a11e4b): GO-WITH-FIXES (blockers=2), folded:
    (bin/ocx.mjs:409). Missing target → inspector correlation only; mismatch → `unknown` (latch keeps a prior block).
 3. Every `unknown` fixture carries `desktopSeen` explicitly (false for pass-through, true for refusal cases).
 Live check: `service` has no `--dry-run` (src/service/cli.ts:169-186) → no live service command is run.
+
+
+Combined-tree check (030 r4 / 031): scratch branch `codex/l1-combined-check` = PR B head 6653faf382 merged with PR C
+head (launcher). Conflict only in `tests/cli/ocx-launcher-runtime.test.ts` (both PRs append a describe block at the end
+of the file; resolution keeps both blocks) and in this plan unit (now synced identically to both branches). Result:
+typecheck pass; 326 pass / 2 skip / 0 fail across launcher runtime/source, bun-runtime, update-desktop-owner,
+version-skew, dispatch, help-recovery; ratchet and structure pass; `node bin/ocx.mjs update --help` exit 0. Whichever of
+PR B / PR C merges second needs that one test-file conflict resolved the same way.
+
