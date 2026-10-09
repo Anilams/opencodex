@@ -48,6 +48,7 @@ import { NATIVE_RESERVE_MODEL } from "./native-models";
 import { isReserveCatalogProjection, type ReserveCatalogProjection } from "./reserve";
 import { deriveEntry, finishUpstreamNativeEntry, isExactComboCatalogEntry } from "./derive-entry";
 import { PICKER_ORDER_PRIORITY_BASE, SPAWN_PRIORITY_FIELD } from "./subagent-roster";
+import { preserveOperatorUltraFastTiers } from "./operator-tiers";
 
 export interface ObservedCatalogEntryBuildInput {
   readonly template: RawEntry | null;
@@ -470,6 +471,8 @@ export function applyFullModelPickerOrder(entries: RawEntry[], order: readonly s
 }
 
 export interface ObservedCatalogMergeInput {
+  /** Preserve operator-supplied Ultra Fast only from the exact persisted routed row. */
+  readonly ultraFastTier?: boolean;
   readonly catalogModels: readonly RawEntry[];
   readonly baselineCatalogModels: readonly RawEntry[];
   readonly routedEntries: readonly RawEntry[];
@@ -510,6 +513,7 @@ export interface ObservedCatalogMergeInput {
  * accidentally fall back to process-ambient catalog discovery or merge-policy warnings.
  */
 export function mergeCatalogEntriesFromObservedState({
+  ultraFastTier = false,
   catalogModels,
   baselineCatalogModels,
   routedEntries,
@@ -849,6 +853,17 @@ export function mergeCatalogEntriesFromObservedState({
     }
     return false;
   });
+  const operatorRows = new Map(detachedCatalogModels.flatMap(entry =>
+    typeof entry.slug === "string" && trustedAccountBoundNativeCatalogSlug(entry) === undefined
+      && !isNativeAliasCatalogEntry(entry) && entry.owned_by !== COMBO_NAMESPACE
+      ? [[entry.slug, entry] as const] : []
+  ));
+  for (const entry of finalRoutedEntries) {
+    if (typeof entry.slug !== "string" || !entry.slug.includes("/")
+      || isNativeAliasCatalogEntry(entry) || isExactComboCatalogEntry(entry, exactComboSlugs)
+      || trustedAccountBoundNativeCatalogSlug(entry) !== undefined) continue;
+    preserveOperatorUltraFastTiers(entry, operatorRows.get(entry.slug), ultraFastTier);
+  }
   const finalRoutedEntrySet = new Set(finalRoutedEntries);
   const degradedPreservedCount = preservedRoutedEntries.filter(entry => {
     if (!finalRoutedEntrySet.has(entry)) return false;

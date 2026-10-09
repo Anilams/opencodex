@@ -1035,6 +1035,14 @@ explicit fields and may combine with existing system options. Showing credits is
 a display preference, not paid-credit opt-in; system Ultra Fast is separate from
 provider Fast.
 
+Ultra Fast is an opt-in retention setting, not a capability or entitlement claim.
+With `--ultra-fast-tier on`, sync and catalog convergence retain an existing routed
+row's operator-supplied `ultrafast` entries in `service_tiers` and
+`additional_speed_tiers` alongside its current Fast capability. Declarations belong
+to the exact provider/model slug; they are not copied to other models. The setting
+does not create missing declarations or restore removed models. Turning it off
+removes Ultra Fast from ordinary routed rows on the next catalog regeneration.
+
 ```bash
 ocx system settings --json
 ocx system settings --show-codex-credits on --json
