@@ -7,7 +7,7 @@
  * transaction, so that race would corrupt the thing the journal exists to keep
  * consistent.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,7 +18,7 @@ import {
   tryAcquire,
   type LockDeps,
 } from "../../src/codex/prompt-lock";
-import { ownEvidence, ownerDefaults } from "../../src/codex/prompt-lock-owner";
+import { createOwnerIdentity, ownEvidence, ownerDefaults } from "../../src/codex/prompt-lock-owner";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { repoPath } from "../helpers/repo-root";
 
@@ -110,23 +110,25 @@ describe("interleavings", () => {
       const fs=await import('node:fs');
       const {tryAcquire,release}=await import(${JSON.stringify(repoPath("src/codex/prompt-lock.ts"))});
       fs.writeFileSync(${JSON.stringify(path + ".ready-")}+${i}, 'ready');
-      const until=Date.now()+3000;
-      while(!fs.existsSync(${JSON.stringify(go)})){if(Date.now()>until)throw Error('barrier timeout');await Bun.sleep(5);}
+      const barrierUntil=Date.now()+15000;
+      while(!fs.existsSync(${JSON.stringify(go)})){if(Date.now()>barrierUntil)throw Error('barrier timeout');await Bun.sleep(5);}
+      const acquisitionUntil=Date.now()+5000;
       const result=tryAcquire(${JSON.stringify(path)});
       const resultPath=${JSON.stringify(path + ".result-")}+${i};
       fs.writeFileSync(resultPath+'.tmp', JSON.stringify(result));
       fs.renameSync(resultPath+'.tmp', resultPath);
-      if(result.ok){while(!fs.existsSync(${JSON.stringify(stop)})){if(Date.now()>until)throw Error('hold timeout');await Bun.sleep(5);}release(result.handle);}
+      if(result.ok){while(!fs.existsSync(${JSON.stringify(stop)})){if(Date.now()>acquisitionUntil)throw Error('hold timeout');await Bun.sleep(5);}release(result.handle);}
     `], { stdout: "pipe", stderr: "pipe" }));
     try {
-      const until = Date.now() + 3000;
+      const barrierUntil = Date.now() + 15000;
       while (!children.every((_, i) => existsSync(path + ".ready-" + i))) {
-        if (Date.now() > until) throw Error("contenders did not reach barrier");
+        if (Date.now() > barrierUntil) throw Error("contenders did not reach barrier");
         await Bun.sleep(5);
       }
+      const acquisitionUntil = Date.now() + 5000;
       writeFileSync(go, "go");
       while (!children.every((_, i) => existsSync(path + ".result-" + i))) {
-        if (Date.now() > until) throw Error("contenders did not finish acquisition");
+        if (Date.now() > acquisitionUntil) throw Error("contenders did not finish acquisition");
         await Bun.sleep(5);
       }
       const results = children.map((_, i) => JSON.parse(readFileSync(path + ".result-" + i, "utf8")));
@@ -138,7 +140,7 @@ describe("interleavings", () => {
       if (retried.ok) release(retried.handle);
       expect(existsSync(path + ".claims")).toBe(false);
     } finally { writeFileSync(stop, "stop"); children.forEach(child => child.kill()); }
-  });
+  }, 25000);
 
   test("a dead process's unique reservation is reclaimed without blocking future writers", async () => {
     const path = lockPath(), ready = path + ".ready";
@@ -444,17 +446,64 @@ describe("owner evidence and namespace guards", () => {
 });
 
 
-test("fresh Windows claims namespace requires the existing directory ACL hardener", () => {
-  const fs = require("node:fs") as typeof import("node:fs");
-  const dir = fs.mkdtempSync(join(tmpdir(), "ocx-win-claims-")), path = join(dir, "config.lock");
-  let hardened = "";
+test("Windows acquisitions rely on profile ACLs without spawning a claims hardener", () => {
+  const path = lockPath();
+  let hardened = 0;
+  const deps = {
+    isProcessAlive: () => true, now: () => 0, platform: "win32" as const,
+    hostIdentity: () => ({ hostname: "fixture-host", machine: "fixture-machine" }),
+    processStart: () => "fixture-start",
+    hardenDirectory: () => { hardened++; return false; },
+  };
+  const spawned = spyOn(Bun, "spawnSync");
   try {
-    const result = tryAcquire(path, {
-      isProcessAlive: () => true, now: () => 0, platform: "win32",
-      hardenDirectory: target => { hardened = target; return false; },
-    });
-    expect(hardened).toBe(path + ".claims");
-    expect(result).toEqual({ ok: false, error: "unsafe", detail: path + ".claims" });
-    expect(fs.existsSync(path)).toBe(false);
-  } finally { removeTreeWithRetry(dir); }
+    for (let i = 0; i < 10; i++) {
+      const result = tryAcquire(path, deps);
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(release(result.handle)).toBe(true);
+    }
+    expect(hardened).toBe(0);
+    expect(spawned).not.toHaveBeenCalled();
+  } finally { spawned.mockRestore(); }
+});
+
+for (const available of [true, false]) test(`Windows identity commands are cached across acquisitions (${available ? "available" : "unavailable"})`, () => {
+  const path = lockPath(), commands: string[][] = [];
+  const identity = createOwnerIdentity({
+    platform: "win32", powerShellExe: () => "fixture-powershell.exe",
+    runCommand(args, timeoutMs) {
+      expect(timeoutMs).toBe(1000);
+      commands.push(args);
+      return available ? (args.at(-1)!.includes("MachineGuid") ? "fixture-machine" : "fixture-start") : undefined;
+    },
+  });
+  expect(commands).toHaveLength(0);
+  const deps = { ...alive, ...identity, platform: "win32" as const };
+  for (let i = 0; i < 20; i++) {
+    const result = tryAcquire(path, deps);
+    expect(result.ok).toBe(true);
+    const record = JSON.parse(readFileSync(path, "utf8"));
+    expect(record.host?.machine).toBe(available ? "fixture-machine" : undefined);
+    expect(record.processStart).toBe(available ? "fixture-start" : undefined);
+    expect(tryAcquire(path, deps).ok).toBe(false);
+    if (result.ok) expect(release(result.handle)).toBe(true);
+  }
+  expect(commands).toHaveLength(2);
+  expect(commands.filter(args => args.at(-1)!.includes("MachineGuid"))).toHaveLength(1);
+  expect(commands.filter(args => args.at(-1)!.includes(`Get-Process -Id ${process.pid} `))).toHaveLength(1);
+  // A live or unknown foreign PID does not require a start-time subprocess.
+  writeFileSync(path, JSON.stringify({ token: "old", pid: 999999999, acquiredAt: 0,
+    host: identity.hostIdentity(), processStart: "fixture-start" }));
+  for (const liveness of [true, undefined]) {
+    const result = tryAcquire(path, { ...deps, isProcessAlive: () => liveness });
+    expect(result.ok).toBe(false);
+  }
+  expect(commands).toHaveLength(2);
+  if (available) {
+    const result = tryAcquire(path, { ...deps, isProcessAlive: () => false });
+    expect(result.ok).toBe(true);
+    expect(commands).toHaveLength(3);
+    expect(commands[2]!.at(-1)).toContain("Get-Process -Id 999999999 ");
+    if (result.ok) expect(release(result.handle)).toBe(true);
+  }
 });

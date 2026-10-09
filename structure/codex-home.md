@@ -325,7 +325,9 @@ remains busy. Foreign-host, unknown-host, legacy and incomplete records are unsa
 preserved for deliberate removal. Unknown process liveness remains busy. The lock file,
 claims directory and entries must have the expected type, current-user ownership on POSIX,
 and no symlinks. On Windows, namespace ownership relies on the per-user profile ACL;
-new claims directories use the existing owner-only ACL hardening helper and refuse if it fails.
+acquisition does not run a separate ACL hardener for claims directories.
+Machine identity and this process's start identity are read lazily once per process, including
+unavailable results. Another PID's start lookup runs only for a takeover decision, with a one-second command timeout.
 Choosing evidence is published atomically before the bakery scan.
 The last reservation removes its directory only with atomic empty-directory rmdir.
 Unsafe acquisition is non-retryable and carries the lock-path diagnostic through writer results.

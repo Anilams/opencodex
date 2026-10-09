@@ -12,14 +12,9 @@ export function withLockClaim<T>(
   initialized?: () => void,
 ): { ok: true; value: T } | { ok: false } {
   const directory = `${path}.claims`;
-  let created = false;
-  try { mkdirSync(directory, { mode: 0o700 }); created = true; }
+  try { mkdirSync(directory, { mode: 0o700 }); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
   if (!safeNamespace(directory, "directory", deps)) throw new UnsafeLockNamespace(directory);
-  if (created && deps.platform === "win32" && !deps.hardenDirectory(directory)) {
-    try { rmdirSync(directory); } catch { /* Preserve a namespace that is no longer empty. */ }
-    throw new UnsafeLockNamespace(directory);
-  }
   const ownName = `${process.pid}-${token}.claim`, ownPath = join(directory, ownName);
   const temporary = `${path}.claim-init-${token}`;
   let published = false;
