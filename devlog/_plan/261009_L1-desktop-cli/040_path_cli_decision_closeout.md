@@ -38,3 +38,16 @@ updater.
 3. Final report: PR links, head SHAs, CI runs, open decisions (Windows evidence, GUI wording for unowned supervision,
    PATH installer follow-up), user-environment suggestions (remove stale `~/.opencodex/service-state.json` via
    `ocx service uninstall` from a working CLI, re-enable Start at Login, repoint `~/.bun/bin/ocx`) — suggestions only.
+
+## Outcome (wp4, 2026-10-09)
+
+Decision unchanged: no Desktop PATH installer in this lane. What users get instead:
+
+- #6802: `ocx status`/`doctor`/`resolve` from an updated CLI name OpenCodex Desktop as the live supervisor and stop
+  recommending `ocx service install`; the docs-site desktop guide (en/ko) gained "Using the ocx CLI with the desktop
+  app" with the bundled CLI path per platform.
+- #6807: when the package launcher cannot run, its failure text names `/Applications/OpenCodex.app/Contents/MacOS/ocx`
+  (or the `~/Applications` copy) when installed; a usable PATH Bun now runs the CLI instead of failing.
+- PR B (wp5): command guards so an updated CLI refuses to compete with the Desktop runtime.
+
+Follow-up (separate unit, not opened by this lane): the native "Install ocx command" design above.
