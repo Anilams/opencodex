@@ -115,8 +115,10 @@ export function renameAtomicFile(
     sleep: Bun.sleepSync,
   },
   publisher: ReplacePublisher = "config",
+  validateBeforeRename?: (destination: string) => void,
 ): void {
   for (let attempt = 0; ; attempt += 1) {
+    validateBeforeRename?.(destination);
     try {
       io.rename(source, destination);
       return;
@@ -137,8 +139,10 @@ export async function renameAtomicFileAsync(
   source: string,
   destination: string,
   publisher: ReplacePublisher = "config",
+  validateBeforeRename?: (destination: string) => void,
 ): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
+    validateBeforeRename?.(destination);
     try {
       renameSync(source, destination);
       return;

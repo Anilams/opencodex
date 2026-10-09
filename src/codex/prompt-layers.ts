@@ -42,7 +42,7 @@ import {
   type JournalRecord,
 } from "./prompt-journal";
 import { release, stillHeld, tryAcquire } from "./prompt-lock";
-import { configWriteLockPath } from "./config-write-lock";
+import { configWriteLockFailureMessage, withConfigWriteLockHeld, publishConfigWrite, publishConfigWriteTarget, watchConfigWriteTargets, type LockHandle } from "./config-write-lock";
 
 // ---------------------------------------------------------------------------
 // Inventory — ONE definition, consumed by the route and the GUI alike.
@@ -645,7 +645,8 @@ export type WriteError =
   // which means another writer won a race — here nobody won and nothing landed.
   | "write_failed"
   | "recovery_required"
-  | "locked";
+  | "locked"
+  | "unsafe";
 
 export type WriteResult =
   | { ok: true; changed: boolean; snapshot: PromptLayerSnapshot }
@@ -680,27 +681,17 @@ function commit(
   ensureDir(storePath);
 
   const acquired = tryAcquire(lockPath);
-  if (!acquired.ok) return { ok: false, error: "locked" };
+  if (!acquired.ok) return { ok: false, error: acquired.error, ...(acquired.error === "unsafe" ? { detail: configWriteLockFailureMessage(acquired) } : {}) };
   const handle = acquired.handle;
 
-  // The config write lock comes SECOND (store -> config is the only order any
-  // path takes): the feature scalars, restores, and the injector all serialize
-  // their config.toml writes through it, and the byte checks below only cover
-  // writers that do not cooperate. Holding it across the whole transaction is
-  // what stops a foreign whole-file rewrite from discarding a projection that
-  // just committed.
-  const configAcquired = tryAcquire(configWriteLockPath(configPath));
-  if (!configAcquired.ok) {
-    release(handle);
-    return { ok: false, error: "locked" };
-  }
-  const configHandle = configAcquired.handle;
-
   try {
+    // Store -> config; cleanup protection starts before config acquisition.
+    const configLocked = withConfigWriteLockHeld(configPath, undefined, configHandle => {
+    watchConfigWriteTargets(configHandle, [storePath, journalPath]);
     // 1. recovery first: a journal on disk means an earlier attempt never
     //    committed, and we must not stack a second transaction on top of it.
-    const recovered = recoverJournal(journalPath, { configPath, storePath });
-    if (!recovered.ok) return { ok: false, error: "recovery_required", detail: recovered.detail };
+    const recovered = recoverJournal(journalPath, { configPath, storePath }, configHandle);
+    if (!recovered.ok) return { ok: false, error: recovered.error, detail: recovered.detail };
 
     // 2. re-read and compare against the caller's edit base.
     const configBytes = readFileOrNull(configPath);
@@ -736,7 +727,7 @@ function commit(
       preStoreBytes: storeBytes,
       postStoreBytes: nextStore,
     };
-    durableWrite(journalPath, encodeJournal(record));
+    publishConfigWriteTarget(configPath, configHandle, journalPath, (destination, hooks) => durableWrite(destination, encodeJournal(record), hooks));
 
     // 4/5. each target re-verifies ITS OWN bytes immediately before its rename,
     //      so a third party writing between step 2 and here is not overwritten.
@@ -754,24 +745,28 @@ function commit(
     try {
       if (configChanged) {
         if (hashBytes(readFileOrNull(configPath)) !== record.preConfig) {
-          return rollback(record, journalPath, "stale_revision");
+          return rollback(record, journalPath, "stale_revision", configHandle);
         }
-        if (nextConfig === null) durableDelete(configPath);
-        else durableWrite(configPath, nextConfig);
+        publishConfigWrite(configPath, configHandle, (destination, hooks) => {
+          if (nextConfig === null) durableDelete(destination, hooks);
+          else durableWrite(destination, nextConfig, hooks);
+        });
       }
       if (storeChanged) {
         if (hashBytes(readFileOrNull(storePath)) !== record.preStore) {
-          return rollback(record, journalPath, "stale_revision");
+          return rollback(record, journalPath, "stale_revision", configHandle);
         }
-        if (nextStore === null) durableDelete(storePath);
-        else durableWrite(storePath, nextStore);
+        publishConfigWriteTarget(configPath, configHandle, storePath, (destination, hooks) => {
+          if (nextStore === null) durableDelete(destination, hooks);
+          else durableWrite(destination, nextStore, hooks);
+        });
       }
     } catch (error) {
       // `rollback` is byte-hash driven and refuses to touch a file it does not
       // recognise, so it is safe to run against a partially applied pair. If it
       // cannot account for what it finds it returns recovery_required, which is the
       // honest answer — better than a silent half-write either way.
-      const undone = rollback(record, journalPath, "write_failed");
+      const undone = rollback(record, journalPath, "write_failed", configHandle);
       return { ...undone, detail: error instanceof Error ? error.message : String(error) } as WriteResult;
     }
 
@@ -784,19 +779,19 @@ function commit(
     }
     if (!stillHeld(handle) || !stillHeld(configHandle)) return { ok: false, error: "write_superseded" };
 
-    durableDelete(journalPath);   // this deletion is the commit
+    publishConfigWriteTarget(configPath, configHandle, journalPath, (destination, hooks) => durableDelete(destination, hooks));   // this deletion is the commit
     // The FULL opts, not just the two paths this transaction owns: rebuilding the
     // snapshot from a narrowed object dropped the injected variant directory, so every
     // successful write reported an empty variant list back to its caller.
     return { ok: true, changed: true, snapshot: readPromptLayers({ ...opts, configPath, storePath }) };
-  } finally {
-    release(configHandle);
-    release(handle);
-  }
+    });
+    return configLocked.ok ? configLocked.value as WriteResult : { ok: false, error: configLocked.error, ...(configLocked.error === "unsafe" ? { detail: configWriteLockFailureMessage(configLocked) } : {}) };
+  } finally { release(handle); }
 }
 
 /** Undo whatever landed, then drop the journal. Never touches an unknown file. */
-function rollback(record: JournalRecord, journalPath: string, error: WriteError): WriteResult {
+function rollback(record: JournalRecord, journalPath: string, error: WriteError, held: LockHandle): WriteResult {
+  try {
   const configNow = hashBytes(readFileOrNull(record.configPath));
   const storeNow = hashBytes(readFileOrNull(record.storePath));
   if (configNow !== record.preConfig && configNow !== record.postConfig) {
@@ -806,15 +801,20 @@ function rollback(record: JournalRecord, journalPath: string, error: WriteError)
     return { ok: false, error: "recovery_required", detail: record.storePath };
   }
   if (configNow === record.postConfig) {
-    if (record.preConfigBytes === null) durableDelete(record.configPath);
-    else durableWrite(record.configPath, record.preConfigBytes);
+    publishConfigWrite(record.configPath, held, (destination, hooks) => {
+      if (record.preConfigBytes === null) durableDelete(destination, hooks);
+      else durableWrite(destination, record.preConfigBytes, hooks);
+    });
   }
   if (storeNow === record.postStore) {
-    if (record.preStoreBytes === null) durableDelete(record.storePath);
-    else durableWrite(record.storePath, record.preStoreBytes);
+    publishConfigWriteTarget(record.configPath, held, record.storePath, (destination, hooks) => {
+      if (record.preStoreBytes === null) durableDelete(destination, hooks);
+      else durableWrite(destination, record.preStoreBytes, hooks);
+    });
   }
-  durableDelete(journalPath);
+  publishConfigWriteTarget(record.configPath, held, journalPath, (destination, hooks) => durableDelete(destination, hooks));
   return { ok: false, error };
+  } catch { return { ok: false, error: "recovery_required" }; }
 }
 
 /** Flip one of the five prompt toggles. */

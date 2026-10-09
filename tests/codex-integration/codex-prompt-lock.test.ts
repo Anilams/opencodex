@@ -18,6 +18,7 @@ import {
   tryAcquire,
   type LockDeps,
 } from "../../src/codex/prompt-lock";
+import { ownEvidence, ownerDefaults } from "../../src/codex/prompt-lock-owner";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { repoPath } from "../helpers/repo-root";
 
@@ -65,7 +66,7 @@ describe("basic acquisition", () => {
 describe("staleness", () => {
   test("a dead owner past the grace window is broken", () => {
     const path = lockPath();
-    writeFileSync(path, JSON.stringify({ token: "old", pid: 999999, acquiredAt: 1_000_000 }), "utf8");
+    writeFileSync(path, JSON.stringify({ ...ownEvidence(ownerDefaults), token: "old", pid: 999999, acquiredAt: 1_000_000 }), "utf8");
     expect(tryAcquire(path, dead).ok).toBe(true);
   });
 
@@ -73,28 +74,28 @@ describe("staleness", () => {
     // A process can die microseconds after writing its lock; a peer mid-write
     // deserves the window.
     const path = lockPath();
-    writeFileSync(path, JSON.stringify({ token: "old", pid: 999999, acquiredAt: 1_000_000 }), "utf8");
+    writeFileSync(path, JSON.stringify({ ...ownEvidence(ownerDefaults), token: "old", pid: 999999, acquiredAt: 1_000_000 }), "utf8");
     const justDied: LockDeps = { isProcessAlive: () => false, now: () => 1_000_000 + 5 };
     expect(tryAcquire(path, justDied)).toEqual({ ok: false, error: "locked" });
   });
 
   test("a live owner is never broken, however old", () => {
     const path = lockPath();
-    writeFileSync(path, JSON.stringify({ token: "old", pid: 1, acquiredAt: 0 }), "utf8");
+    writeFileSync(path, JSON.stringify({ ...ownEvidence(ownerDefaults), token: "old", pid: 1, acquiredAt: 0 }), "utf8");
     expect(tryAcquire(path, alive)).toEqual({ ok: false, error: "locked" });
   });
 
-  test("only aged unparseable debris is treated as stale", () => {
+  test("unparseable hostless debris is unsafe regardless of age", () => {
     const path = lockPath();
     writeFileSync(path, "not json", "utf8");
-    expect(tryAcquire(path, dead)).toEqual({ ok: false, error: "locked" });
+    expect(tryAcquire(path, dead)).toEqual({ ok: false, error: "unsafe", detail: path });
     utimesSync(path, 0, 0);
-    expect(tryAcquire(path, dead).ok).toBe(true);
+    expect(tryAcquire(path, dead)).toEqual({ ok: false, error: "unsafe", detail: path });
   });
 
   test("breaking leaves no quarantine file behind", () => {
     const path = lockPath();
-    writeFileSync(path, JSON.stringify({ token: "old", pid: 999999, acquiredAt: 1_000_000 }), "utf8");
+    writeFileSync(path, JSON.stringify({ ...ownEvidence(ownerDefaults), token: "old", pid: 999999, acquiredAt: 1_000_000 }), "utf8");
     expect(tryAcquire(path, dead).ok).toBe(true);
     const strays = readdirSync(join(path, "..")).filter(f => f.includes(".stale-"));
     expect(strays).toEqual([]);
@@ -104,7 +105,7 @@ describe("staleness", () => {
 describe("interleavings", () => {
   test("real concurrent contenders admit at most one live owner and leave retries usable", async () => {
     const path = lockPath(), go = path + ".go", stop = path + ".stop";
-    writeFileSync(path, JSON.stringify({ token: "old", pid: 999999999, acquiredAt: 0 }));
+    writeFileSync(path, JSON.stringify({ ...ownEvidence(ownerDefaults), token: "old", pid: 999999999, acquiredAt: 0 }));
     const children = Array.from({ length: 8 }, (_, i) => Bun.spawn([process.execPath, "-e", `
       const fs=await import('node:fs');
       const {tryAcquire,release}=await import(${JSON.stringify(repoPath("src/codex/prompt-lock.ts"))});
@@ -141,7 +142,7 @@ describe("interleavings", () => {
 
   test("a dead process's unique reservation is reclaimed without blocking future writers", async () => {
     const path = lockPath(), ready = path + ".ready";
-    writeFileSync(path, JSON.stringify({ token: "old", pid: 999999999, acquiredAt: 0 }));
+    writeFileSync(path, JSON.stringify({ ...ownEvidence(ownerDefaults), token: "old", pid: 999999999, acquiredAt: 0 }));
     const child = Bun.spawn([process.execPath, "-e", `
       const fs = await import('node:fs');
       const {tryAcquire} = await import(${JSON.stringify(repoPath("src/codex/prompt-lock.ts"))});
@@ -167,7 +168,7 @@ describe("interleavings", () => {
 
   test("separate processes cannot move a successor after an earlier stale observation", async () => {
     const path = lockPath();
-    writeFileSync(path, JSON.stringify({ token: "old", pid: 999999999, acquiredAt: 0 }));
+    writeFileSync(path, JSON.stringify({ ...ownEvidence(ownerDefaults), token: "old", pid: 999999999, acquiredAt: 0 }));
     const ready = path + ".ready", go = path + ".go", stop = path + ".stop";
     const modulePath = repoPath("src/codex/prompt-lock.ts");
     const a = Bun.spawn([process.execPath, "-e", `
@@ -228,7 +229,7 @@ describe("interleavings", () => {
     }
   });
 
-  test("a separate process initializing an empty exclusive lock is respected", async () => {
+  test("an incomplete hostless exclusive lock is unsafe and preserved", async () => {
     const path = lockPath(), ready = path + ".ready", go = path + ".go";
     const token = "initializing-owner";
     const child = Bun.spawn([process.execPath, "-e", `
@@ -249,7 +250,7 @@ describe("interleavings", () => {
         if (Date.now() > until) throw Error("initializer did not reach barrier");
         await Bun.sleep(5);
       }
-      expect(tryAcquire(path)).toEqual({ ok: false, error: "locked" });
+      expect(tryAcquire(path)).toEqual({ ok: false, error: "unsafe", detail: path });
       writeFileSync(go, "go");
       expect(await child.exited).toBe(0);
       expect(JSON.parse(readFileSync(path, "utf8")).token).toBe(token);
@@ -258,7 +259,7 @@ describe("interleavings", () => {
 
   test("46a: A quarantines, B acquires first, A backs off without touching B's lock", () => {
     const path = lockPath();
-    writeFileSync(path, JSON.stringify({ token: "old", pid: 999999, acquiredAt: 1_000_000 }), "utf8");
+    writeFileSync(path, JSON.stringify({ ...ownEvidence(ownerDefaults), token: "old", pid: 999999, acquiredAt: 1_000_000 }), "utf8");
 
     // Simulate the interleaving: B wins the real lock while A is mid-takeover.
     let renamed = false;
@@ -303,7 +304,7 @@ describe("interleavings", () => {
 
   test("46c: only one of two simultaneous contenders wins a stale lock", () => {
     const path = lockPath();
-    writeFileSync(path, JSON.stringify({ token: "old", pid: 999999, acquiredAt: 1_000_000 }), "utf8");
+    writeFileSync(path, JSON.stringify({ ...ownEvidence(ownerDefaults), token: "old", pid: 999999, acquiredAt: 1_000_000 }), "utf8");
     const first = tryAcquire(path, dead);
     const second = tryAcquire(path, dead);
     expect([first.ok, second.ok].filter(Boolean)).toHaveLength(1);
@@ -317,4 +318,143 @@ describe("interleavings", () => {
     writeFileSync(path, JSON.stringify({ token: "theirs", pid: 1, acquiredAt: 0 }), "utf8");
     expect(stillHeld(held.handle)).toBe(false);
   });
+});
+
+describe("owner evidence and namespace guards", () => {
+  const host = { hostname: "fixture-host", machine: "fixture-boot" };
+  const deps: LockDeps = {
+    now: () => 1_000_000,
+    hostIdentity: () => host,
+    processStart: () => "fixture-start",
+    isProcessAlive: pid => pid === process.pid,
+  };
+  const record = (overrides = {}) => ({ token: "old", pid: 999999999,
+    acquiredAt: 0, host, processStart: "fixture-start", ...overrides });
+  function assertUnsafe(path: string, injected: LockDeps = deps, detail = path): void {
+    const before = existsSync(path) ? readFileSync(path, "utf8") : null;
+    const result = tryAcquire(path, injected);
+    expect(result).toEqual({ ok: false, error: "unsafe", detail });
+    expect(existsSync(path) ? readFileSync(path, "utf8") : null).toBe(before);
+  }
+  test("foreign-host records refuse takeover", () => {
+    const path = lockPath(); writeFileSync(path, JSON.stringify(record({ host: { ...host, machine: "foreign" } })));
+    assertUnsafe(path);
+  });
+  test("hostless legacy records refuse takeover", () => {
+    const path = lockPath(); writeFileSync(path, JSON.stringify({ token: "legacy", pid: 999999999, acquiredAt: 0 }));
+    assertUnsafe(path);
+  });
+  test("same-host live owners remain busy", () => {
+    const path = lockPath(); writeFileSync(path, JSON.stringify(record({ pid: process.pid })));
+    expect(tryAcquire(path, deps)).toEqual({ ok: false, error: "locked" });
+  });
+  test("same-host proven dead owners are taken over", () => {
+    const path = lockPath(); writeFileSync(path, JSON.stringify(record()));
+    const result = tryAcquire(path, deps); expect(result.ok).toBe(true);
+    if (result.ok) release(result.handle);
+  });
+  test("a reused PID with another start identity is never taken over", () => {
+    const path = lockPath(); writeFileSync(path, JSON.stringify(record()));
+    expect(tryAcquire(path, { ...deps, processStart: () => "new-start" })).toEqual({ ok: false, error: "locked" });
+    expect(JSON.parse(readFileSync(path, "utf8")).token).toBe("old");
+  });
+  test("unreadable host identity writes hostless and cannot break hostless evidence", () => {
+    const path = lockPath();
+    const unknown = { ...deps, hostIdentity: () => { throw Error("unavailable identity"); } };
+    const acquired = tryAcquire(path, unknown); expect(acquired.ok).toBe(true);
+    expect(JSON.parse(readFileSync(path, "utf8")).host).toBeUndefined();
+    assertUnsafe(path, unknown);
+    if (acquired.ok) release(acquired.handle);
+  });
+  test("Windows unknown liveness is alive", () => {
+    const path = lockPath(); writeFileSync(path, JSON.stringify(record()));
+    expect(tryAcquire(path, { ...deps, platform: "win32", isProcessAlive: () => undefined })).toEqual({ ok: false, error: "locked" });
+  });
+  test("a lock path symlink is unsafe", () => {
+    const path = lockPath(), target = path + ".target";
+    writeFileSync(target, JSON.stringify(record())); require("node:fs").symlinkSync(target, path);
+    assertUnsafe(path);
+    expect(require("node:fs").lstatSync(path).isSymbolicLink()).toBe(true);
+  });
+  test.skipIf(process.platform === "win32")("a lock owned by another uid is unsafe", () => {
+    const path = lockPath(); writeFileSync(path, JSON.stringify(record()));
+    const fs = require("node:fs") as typeof import("node:fs");
+    assertUnsafe(path, { ...deps, lstat: p => {
+      const stat = fs.lstatSync(p);
+      if (p === path) Object.defineProperty(stat, "uid", { value: (process.getuid?.() ?? 0) + 1 });
+      return stat;
+    } });
+  });
+  for (const kind of ["symlink", "file"] as const) test(`a ${kind} claims namespace is unsafe`, () => {
+    const path = lockPath(), dir = path + ".claims", fs = require("node:fs") as typeof import("node:fs");
+    if (kind === "file") writeFileSync(dir, "preserve");
+    else { fs.mkdirSync(dir + ".target"); fs.symlinkSync(dir + ".target", dir); }
+    const result = tryAcquire(path, deps);
+    expect(result).toEqual({ ok: false, error: "unsafe", detail: dir });
+    expect(fs.lstatSync(dir).isSymbolicLink() ? fs.readlinkSync(dir) : readFileSync(dir, "utf8")).toBe(kind === "file" ? "preserve" : dir + ".target");
+  });
+  for (const kind of ["symlink", "directory"] as const) test(`a ${kind} claim entry is unsafe and preserved`, () => {
+    const path = lockPath(), dir = path + ".claims", fs = require("node:fs") as typeof import("node:fs");
+    fs.mkdirSync(dir); const entry = join(dir, "999999999-0123456789abcdef.claim");
+    if (kind === "directory") fs.mkdirSync(entry);
+    else { writeFileSync(path + ".target", "preserve"); fs.symlinkSync(path + ".target", entry); }
+    expect(tryAcquire(path, deps)).toEqual({ ok: false, error: "unsafe", detail: entry });
+    expect(fs.lstatSync(entry).isSymbolicLink() || fs.lstatSync(entry).isDirectory()).toBe(true);
+  });
+  for (const kind of ["directory", "entry"] as const) test.skipIf(process.platform === "win32")(`another uid's claims ${kind} refuses without running the writer`, () => {
+    const path = lockPath(), dir = path + ".claims", fs = require("node:fs") as typeof import("node:fs");
+    fs.mkdirSync(dir); const entry = join(dir, "999999999-0123456789abcdef.claim");
+    const body = JSON.stringify({ ...record(), ticket: 1 }); writeFileSync(entry, body);
+    const foreign = kind === "directory" ? dir : entry;
+    const injected = { ...ownerDefaults, ...deps, lstat: (p: string) => {
+      const stat = fs.lstatSync(p);
+      if (p === foreign) Object.defineProperty(stat, "uid", { value: (process.getuid?.() ?? 0) + 1 });
+      return stat;
+    } };
+    let ran = false;
+    const { withLockClaim } = require("../../src/codex/prompt-lock-claim") as typeof import("../../src/codex/prompt-lock-claim");
+    expect(() => withLockClaim(path, "fedcba9876543210", injected, () => { ran = true; })).toThrow("Unsafe lock state");
+    expect(ran).toBe(false); expect(readFileSync(entry, "utf8")).toBe(body);
+  });
+  test("incomplete hostless claim debris is unsafe and names its path", () => {
+    const path = lockPath(), dir = path + ".claims";
+    require("node:fs").mkdirSync(dir); const entry = join(dir, "999999999-0123456789abcdef.claim");
+    writeFileSync(entry, "");
+    expect(tryAcquire(path, deps)).toEqual({ ok: false, error: "unsafe", detail: entry });
+    expect(readFileSync(entry, "utf8")).toBe("");
+  });
+  for (const killed of [false, true]) test(killed ? "a killed initialized reservation is recovered" : "a live paused initializer yields busy", async () => {
+    const path = lockPath();
+    const child = Bun.spawn([process.execPath, "-e", `
+      const {readSync}=require('node:fs');
+      const {tryAcquire,release}=require(${JSON.stringify(repoPath("src/codex/prompt-lock.ts"))});
+      const acquired=tryAcquire(${JSON.stringify(path)},{now:Date.now,isProcessAlive:pid=>{try{process.kill(pid,0);return true}catch{return false}},
+        onClaimInitialized(){console.log('initialized');readSync(0,Buffer.alloc(1),0,1,null);}});
+      if(acquired.ok)release(acquired.handle);
+    `], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    try {
+      const reader = child.stdout.getReader(); const message = await reader.read(); reader.releaseLock();
+      expect(new TextDecoder().decode(message.value)).toContain("initialized");
+      if (killed) { child.kill(); await child.exited; }
+      const result = tryAcquire(path);
+      if (killed) { expect(result.ok).toBe(true); if (result.ok) release(result.handle); }
+      else { expect(result).toEqual({ ok: false, error: "locked" }); child.stdin.write("g"); child.stdin.end(); expect(await child.exited).toBe(0); }
+    } finally { child.kill(); }
+  });
+});
+
+
+test("fresh Windows claims namespace requires the existing directory ACL hardener", () => {
+  const fs = require("node:fs") as typeof import("node:fs");
+  const dir = fs.mkdtempSync(join(tmpdir(), "ocx-win-claims-")), path = join(dir, "config.lock");
+  let hardened = "";
+  try {
+    const result = tryAcquire(path, {
+      isProcessAlive: () => true, now: () => 0, platform: "win32",
+      hardenDirectory: target => { hardened = target; return false; },
+    });
+    expect(hardened).toBe(path + ".claims");
+    expect(result).toEqual({ ok: false, error: "unsafe", detail: path + ".claims" });
+    expect(fs.existsSync(path)).toBe(false);
+  } finally { removeTreeWithRetry(dir); }
 });

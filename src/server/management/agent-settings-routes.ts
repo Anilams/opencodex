@@ -429,10 +429,10 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
      */
     const needsCodexConfigWrites = requestedFlag !== undefined || wantsThreads
       || wantsAgentsEnabled || wantsMaxDepth || wantsSubagentInstructions || wantsModeHintText;
-    const { acquireConfigWriteLock, releaseConfigWriteLock, CONFIG_WRITE_LOCKED_MESSAGE } = await import("../../codex/config-write-lock");
+    const { acquireConfigWriteLock, releaseConfigWriteLock, configWriteLockFailureMessage } = await import("../../codex/config-write-lock");
     const configWriteLock = needsCodexConfigWrites ? await acquireConfigWriteLock(activeCodexConfigPath()) : null;
     if (configWriteLock !== null && !configWriteLock.ok) {
-      return jsonResponse({ error: CONFIG_WRITE_LOCKED_MESSAGE }, 502);
+      return jsonResponse({ error: configWriteLockFailureMessage(configWriteLock), retryable: configWriteLock.error === "locked" }, 502);
     }
     const heldWriteLock = configWriteLock !== null && configWriteLock.ok ? configWriteLock.handle : undefined;
     try {
@@ -441,13 +441,13 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
     let toggle = deps.toggleCodexMultiAgentV2;
     if (!toggle) {
       const { runCodexFeaturesCommand } = await import("../../cli/v2");
-      toggle = (enabled: boolean) => runCodexFeaturesCommand(enabled ? "enable" : "disable");
+      toggle = (enabled, env, validate) => runCodexFeaturesCommand(enabled ? "enable" : "disable", "multi_agent_v2", env, validate);
       }
       const result = transitionMultiAgentV2(targetFlag, toggle, {
         ...(wantsThreads ? { threadLimit: body.maxConcurrentThreadsPerSession as number } : {}),
         heldConfigWriteLock: heldWriteLock,
       });
-      if (!result.ok) return jsonResponse({ error: `multi_agent_v2 transition failed: ${result.error}` }, 502);
+      if (!result.ok) return jsonResponse({ error: `multi_agent_v2 transition failed: ${result.error}`, ...(result.retryable === false ? { retryable: false } : {}) }, 502);
       if (result.changed && result.threadLimit !== null) warnings.push(`Thread limit ${result.threadLimit} preserved for ${targetFlag ? "v2" : "v1"}.`);
     }
     if (wantsMode) {
@@ -559,20 +559,23 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
     let toggle = deps.toggleDefaultModeRequestUserInput;
     if (!toggle) {
       const { runCodexFeaturesCommand } = await import("../../cli/v2");
-      toggle = (enabled: boolean) => runCodexFeaturesCommand(enabled ? "enable" : "disable", DEFAULT_MODE_REQUEST_USER_INPUT_FEATURE_KEY);
+      toggle = (enabled, env, validate) => runCodexFeaturesCommand(enabled ? "enable" : "disable", DEFAULT_MODE_REQUEST_USER_INPUT_FEATURE_KEY, env, validate);
     }
     // The `codex features` subprocess rewrites config.toml itself — run it
     // under the shared write lock so it cannot interleave with an opencodex
     // scalar edit or injection mid-write on either side.
-    const { acquireConfigWriteLock, releaseConfigWriteLock, CONFIG_WRITE_LOCKED_MESSAGE } = await import("../../codex/config-write-lock");
-    const configLock = await acquireConfigWriteLock(activeCodexConfigPath());
+    const { acquireConfigWriteLock, releaseConfigWriteLock, configWriteLockFailureMessage, runConfigWriteChild, ConfigWriteDestinationChanged } = await import("../../codex/config-write-lock");
+    const configPath = activeCodexConfigPath();
+    const configLock = await acquireConfigWriteLock(configPath);
     if (!configLock.ok) {
-      return jsonResponse({ error: CONFIG_WRITE_LOCKED_MESSAGE }, 502);
+      return jsonResponse({ error: configWriteLockFailureMessage(configLock), retryable: configLock.error === "locked" }, 502);
     }
     let toggleError: string | null = null;
+    let destinationChanged = false;
     try {
-      toggle(body.enabled);
+      runConfigWriteChild(configPath, configLock.handle, (env, validate) => toggle!(body.enabled as boolean, env, validate));
     } catch (error) {
+      destinationChanged = error instanceof ConfigWriteDestinationChanged;
       const err = error as { stderr?: unknown; message?: string };
       const raw = err.stderr;
       const stderrText = typeof raw === "string"
@@ -582,6 +585,7 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
     } finally {
       releaseConfigWriteLock(configLock.handle);
     }
+    if (destinationChanged) return jsonResponse({ error: toggleError, retryable: false }, 502);
     const enabled = isDefaultModeRequestUserInputEnabled();
     if (toggleError !== null || enabled !== body.enabled) {
       const reason = toggleError

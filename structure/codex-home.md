@@ -292,17 +292,50 @@ OpenCodex config writers share `config.toml.ocx-write.lock`: feature scalar and 
 batches, injection, journal replay, removal, and restore/compensation read and write while
 holding it. Injection and coordinated restore take config before SQLite N; prompt writes
 take prompt-store before config. Nested writers receive an explicit live handle for the
-same config path; implicit nesting refuses fast. Async callers wait at most two seconds.
+same canonical config destination; implicit nesting refuses fast. Symlink aliases contend
+on the real destination's lock. Each publication revalidates canonical identity and inode immediately before rename,
+including each Windows retry; the confirmed publication hook advances that witness. Async acquisition uses a monotonic
+deadline, defaults to two seconds, and accepts only integer timeouts from zero to ten
+seconds. Zero permits one immediate attempt.
+Native feature commands in `src/cli/v2.ts` receive an explicit child environment with
+`CODEX_HOME` bound to the canonical home recorded by the held config lock, without
+an inherited Orca home override or case-variant home key. Native feature paths retain
+the selected home alias, including the default `.codex`, for drift validation. The held destination is
+validated immediately before spawning and after exit, including failed exits. Native commands
+require the held canonical destination to be the canonical child home's config.toml; a link
+to a differently named file refuses before transition staging or child writes.
+The child boundary captures exact bytes or proven absence and file identity immediately before
+spawn. Alias drift restores that preimage through the canonical path while the lock remains held;
+a multi-agent transition restores its original bytes, including edits staged before the child.
+Recovery validates the canonical file identity immediately before publication and every rename
+retry. A changed canonical target refuses recovery, preserves existing journal evidence, and
+retains a private preimage file beside the canonical config with its location in the diagnostic.
+Drift is non-retryable and stops further parent publication or alias-based compensation; a
+successful child replacement advances the inode witness before subsequent parent writes.
 
 `src/codex/prompt-lock-claim.ts` reserves the acquisition/takeover interval with a unique
 PID/token file and bakery ticket. A contender still choosing makes peers refuse, and a
 later contender sees an earlier published ticket. Dead reservations are removed by their
 unique filename; stale observation cannot rename a live successor's reusable lock path.
-Fresh malformed/empty lock files receive the ten-second initialization grace period.
+Lock and claim records include host and process-start evidence. Takeover requires a
+matching local host and a proven dead owner; a reused PID with a different start identity
+remains busy. Foreign-host, unknown-host, legacy and incomplete records are unsafe and
+preserved for deliberate removal. Unknown process liveness remains busy. The lock file,
+claims directory and entries must have the expected type, current-user ownership on POSIX,
+and no symlinks. On Windows, namespace ownership relies on the per-user profile ACL;
+new claims directories use the existing owner-only ACL hardening helper and refuse if it fails.
+Choosing evidence is published atomically before the bakery scan.
 The last reservation removes its directory only with atomic empty-directory rmdir.
+Unsafe acquisition is non-retryable and carries the lock-path diagnostic through writer results.
+Automatic recovery is a no-op when the Codex home is proven absent and creates nothing.
 Journal replay selects its current evidence under the config lock; automatic recovery
 also decides owner liveness there and passes the held handle to replay, so stale evidence
 cannot authorize restoration of a replacement journal owned by a live session.
+Absence handling, profile removal, courtesy cleanup and compensation share this section.
+Prompt commits acquire through the held-handle helper and release the store lock even if
+config acquisition throws. Recovery and compensation revalidate the destination before
+writing and retain recovery evidence if the destination or selected journal changes.
+Incomplete config/profile compensation preserves the current journal as recovery authority.
 `tests/codex-integration/codex-prompt-lock.test.ts` uses separate synthetic processes to
 cover stale observation, initialization, and a killed reservation owner.
 

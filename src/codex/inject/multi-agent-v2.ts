@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import type { OcxConfig } from "../../types";
-import type { LockHandle } from "../config-write-lock";
+import { ConfigWriteDestinationChanged, type LockHandle } from "../config-write-lock";
 import { CODEX_CONFIG_PATH } from "../paths";
 
 /**
@@ -19,11 +19,11 @@ export type InjectedV1SurfaceReconcile =
   | { ok: true; content: string; changed: boolean }
   | { ok: false; message: string };
 
-let toggleForTests: ((enabled: boolean) => void) | undefined;
+let toggleForTests: ((enabled: boolean, env: NodeJS.ProcessEnv, validateBeforeSpawn: () => void) => void) | undefined;
 
 /** Test seam: substitute the native `codex features` toggle so no Codex runtime is required. */
 export function setCodexMultiAgentV2ToggleForTests(
-  toggle: ((enabled: boolean) => void) | undefined,
+  toggle: ((enabled: boolean, env: NodeJS.ProcessEnv, validateBeforeSpawn: () => void) => void) | undefined,
 ): void {
   toggleForTests = toggle;
 }
@@ -71,7 +71,7 @@ export async function prepareInjectedV1SurfaceReconcile(
   let toggle = toggleForTests;
   if (!toggle) {
     const { runCodexFeaturesCommand } = await import("../../cli/v2");
-    toggle = enabled => runCodexFeaturesCommand(enabled ? "enable" : "disable");
+    toggle = (enabled, env, validate) => runCodexFeaturesCommand(enabled ? "enable" : "disable", "multi_agent_v2", env, validate);
   }
   const resolvedToggle = toggle;
   return {
@@ -86,6 +86,7 @@ export async function prepareInjectedV1SurfaceReconcile(
         ...(heldConfigWriteLock !== undefined ? { heldConfigWriteLock } : {}),
       });
       if (!transition.ok) {
+        if (transition.retryable === false) throw new ConfigWriteDestinationChanged(transition.error);
         return {
           ok: false,
           message: `Codex config injection refused: could not reconcile the v1 surface with the global multi_agent_v2 feature: ${transition.error}.`,

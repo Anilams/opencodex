@@ -1,7 +1,8 @@
+import { beginCodexWriteSection, publishCodexArtifact } from "./config-write-section";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { normalizeStructuralWhitespace, rootAssignmentKey, rootSourceLines, sourceAssignment, sourceText } from "../toml-source-lines";
 import { atomicWriteFile } from "../../config";
-import { CONFIG_WRITE_LOCKED_MESSAGE, withConfigWriteLockHeld } from "../config-write-lock";
+import { ConfigWriteLockRefusal, configWriteLockFailureMessage, withConfigWriteLockHeld } from "../config-write-lock";
 import type { LockHandle } from "../config-write-lock";
 import {
   REALTIME_WS_BASE_URL_KEY,
@@ -48,19 +49,21 @@ export function readOcxProviderTableBlock(): string | null {
  * to reach anyway.
  */
 export function retainOcxProviderTableOnDisk(block: string, heldConfigWriteLock?: LockHandle): string[] | null {
-  if (!existsSync(CODEX_CONFIG_PATH)) return null;
   // The read, the append, and the rename are one section under the shared
   // write lock; an unlocked read+rename here could discard a concurrent
   // scalar or projection write.
-  const locked = withConfigWriteLockHeld(CODEX_CONFIG_PATH, heldConfigWriteLock, () => {
+  const locked = withConfigWriteLockHeld(CODEX_CONFIG_PATH, heldConfigWriteLock, held => {
+    beginCodexWriteSection(held);
+    if (!existsSync(CODEX_CONFIG_PATH)) return null;
     const rawContent = readFileSync(CODEX_CONFIG_PATH, "utf-8");
     const eol = dominantEol(rawContent);
     const content = applyEol(rawContent, "\n");
     const next = appendOcxProviderTableBlock(content, block);
-    if (next !== content) atomicWriteFile(CODEX_CONFIG_PATH, applyEol(next, eol));
+    if (next !== content) publishCodexArtifact(CODEX_CONFIG_PATH, held, (path, hooks) => atomicWriteFile(path, applyEol(next, eol), undefined, hooks));
+    return block.replace(/\n+$/, "").split("\n");
   });
-  if (!locked.ok) throw new Error(CONFIG_WRITE_LOCKED_MESSAGE);
-  return block.replace(/\n+$/, "").split("\n");
+  if (!locked.ok) throw new ConfigWriteLockRefusal(locked);
+  return locked.value;
 }
 
 interface StripOpencodexConfigResult {
@@ -175,6 +178,7 @@ export interface RemoveCodexConfigOptions {
 }
 
 export interface RemoveCodexConfigResult {
+  retryable?: boolean;
   success: boolean;
   message: string;
   /** The exact lines left on disk when the disposition was `stand-down-retain`. */
@@ -194,15 +198,16 @@ export function removeCodexConfig(
   if (historyError && !(historyDisposition !== "refuse-on-any" && historyError === HISTORY_RELABEL_STANDS_DOWN)) {
     return { success: false, message: `Codex configuration preserved: ${historyError}. Native writer coordination is required.` };
   }
+  const locked = withConfigWriteLockHeld(CODEX_CONFIG_PATH, options.heldConfigWriteLock, held => {
+  beginCodexWriteSection(held);
   if (!existsSync(CODEX_CONFIG_PATH)) {
     if (!options.preserveProfile && existsSync(CODEX_PROFILE_PATH))
-      unlinkSync(CODEX_PROFILE_PATH);
+      publishCodexArtifact(CODEX_PROFILE_PATH, held, (path, hooks) => { hooks.validateBeforeRename?.(path); unlinkSync(path); hooks.afterRename?.(path); });
     return {
       success: true,
       message: `Codex config not found; no native restore was needed${options.preserveProfile ? "." : ", and the opencodex profile was removed if present."}`,
     };
   }
-  const locked = withConfigWriteLockHeld(CODEX_CONFIG_PATH, options.heldConfigWriteLock, () => {
   const rawContent = readFileSync(CODEX_CONFIG_PATH, "utf-8");
   // Same EOL boundary as inject: strip in LF space, write back in the file's own ending.
   // The unchanged fast path compares in LF space so an untouched file is never rewritten.
@@ -234,10 +239,10 @@ export function removeCodexConfig(
     ? stripped.content
     : appendOcxProviderTableBlock(stripped.content, retainedBlock);
   if (had || finalContent !== content) {
-    atomicWriteFile(CODEX_CONFIG_PATH, applyEol(finalContent, eol));
+    publishCodexArtifact(CODEX_CONFIG_PATH, held, (path, hooks) => atomicWriteFile(path, applyEol(finalContent, eol), undefined, hooks));
   }
   if (!options.preserveProfile && existsSync(CODEX_PROFILE_PATH))
-    unlinkSync(CODEX_PROFILE_PATH);
+    publishCodexArtifact(CODEX_PROFILE_PATH, held, (path, hooks) => { hooks.validateBeforeRename?.(path); unlinkSync(path); hooks.afterRename?.(path); });
   const retainedNote = retainedBlock === null
     ? ""
     : " Kept [model_providers.opencodex] so conversations already tagged opencodex still open;"
@@ -262,6 +267,6 @@ export function removeCodexConfig(
     ...(retainedBlock === null ? {} : { retainedProviderTable: retainedBlock.replace(/\n+$/, "").split("\n") }),
   };
   });
-  if (!locked.ok) return { success: false, message: CONFIG_WRITE_LOCKED_MESSAGE };
+  if (!locked.ok) return { success: false, retryable: locked.error === "locked", message: configWriteLockFailureMessage(locked) };
   return locked.value;
 }

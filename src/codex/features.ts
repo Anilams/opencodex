@@ -35,10 +35,11 @@ import { existsSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { createRequire } from "node:module";
 import { realpathSync } from "node:fs";
-import { AtomicWriteResidualTempError, AtomicWriteSecretResidualError, atomicWriteFile, expandUserPath, getConfigDir } from "../config";
-import { CONFIG_WRITE_LOCKED_MESSAGE, withConfigWriteLock, withConfigWriteLockHeld, type LockHandle } from "./config-write-lock";
+import { homedir } from "node:os";
+import { AtomicWriteResidualTempError, AtomicWriteSecretResidualError, atomicWriteFile, getConfigDir } from "../config";
+import { ConfigWriteDestinationChanged, assertNativeConfigWriteDestination, runConfigWriteChild, publishConfigWrite, configWriteLockFailureMessage, withConfigWriteLock, withConfigWriteLockHeld, type LockHandle } from "./config-write-lock";
 import { forgetEphemeralSecretPath } from "../lib/windows-secret-acl";
-import { CODEX_CONFIG_PATH } from "./paths";
+import { resolveCodexHomeDir } from "./home";
 import { resolveAndPersistCodexRuntime } from "./runtime";
 import { decodeOverlayState } from "./shim-state-file";
 import { canonicalizeOpenCodexModeHint } from "./multi-agent-mode-policy";
@@ -69,14 +70,14 @@ function mergeTrailingComments(existing?: string, migrated?: string): string {
 }
 
 export function activeCodexConfigPath(): string {
-  const raw = process.env.CODEX_HOME?.trim();
-  if (!raw) return CODEX_CONFIG_PATH;
-  const path = resolve(expandUserPath(raw));
-  try {
-    return join(realpathSync.native(path), "config.toml");
-  } catch {
-    return join(path, "config.toml");
+  // Keep home aliases observable by the held destination validator.
+  const home = resolveCodexHomeDir();
+  if (!process.env.CODEX_HOME?.trim()) {
+    const alias = join(homedir(), ".codex");
+    try { if (realpathSync(alias) === home) return join(alias, "config.toml"); }
+    catch { /* An absent local home can select the WSL Windows-home fallback. */ }
   }
+  return join(home, "config.toml");
 }
 
 function readConfigText(configPath?: string): string | null {
@@ -115,16 +116,16 @@ function editCodexConfigToml(
   edit: (content: string) => TomlEditOutcome,
   heldConfigWriteLock?: LockHandle,
 ): ConfigEditResult {
-  const locked = withConfigWriteLockHeld(path, heldConfigWriteLock, (): ConfigEditResult => {
+  const locked = withConfigWriteLockHeld(path, heldConfigWriteLock, (held): ConfigEditResult => {
     const content = readConfigText(path);
     if (content === null) return { ok: false, error: `config.toml not readable at ${path}` };
     const outcome = edit(content);
     if ("error" in outcome) return { ok: false, error: outcome.error };
     if (outcome.next === content) return { ok: true, changed: false };
-    atomicWriteFile(path, outcome.next);
+    publishConfigWrite(path, held, (destination, hooks) => atomicWriteFile(destination, outcome.next, undefined, hooks));
     return { ok: true, changed: true };
   });
-  if (!locked.ok) return { ok: false, error: CONFIG_WRITE_LOCKED_MESSAGE };
+  if (!locked.ok) return { ok: false, error: configWriteLockFailureMessage(locked), ...(locked.error === "unsafe" ? { retryable: false } : {}) };
   return locked.value;
 }
 
@@ -520,7 +521,7 @@ export function setMaxConcurrentThreads(value: number, configPath?: string, migr
   return editCodexConfigToml(path, content => maxConcurrentThreadsEdit(content, value, migratedComment));
 }
 
-type ConfigEditResult = { ok: true; changed: boolean } | { ok: false; error: string };
+type ConfigEditResult = { ok: true; changed: boolean } | { ok: false; error: string; retryable?: boolean };
 
 /**
  * Encode a string as a TOML single-line basic string.
@@ -1464,7 +1465,7 @@ export function isAtomicResidualError(error: unknown): boolean {
  * discarded by the byte-restore rollback. The per-call edits inside run on the
  * temp path, which takes its own lock harmlessly.
  */
-function applyConfigEditsAtomically(path: string, edit: (tempPath: string) => ConfigEditResult): ConfigEditResult {
+function applyConfigEditsAtomically(path: string, held: LockHandle, edit: (tempPath: string) => ConfigEditResult): ConfigEditResult {
   const content = readConfigText(path);
   if (content === null) return { ok: false, error: `config.toml not readable at ${path}` };
   const tempPath = `${path}.ocx-migration.${process.pid}.${++migrationEditSeq}`;
@@ -1478,7 +1479,7 @@ function applyConfigEditsAtomically(path: string, edit: (tempPath: string) => Co
     const edited = readConfigText(tempPath);
     if (edited === null) return { ok: false, error: "temporary config migration output is unreadable" };
     if (edited === content) return { ok: true, changed: false };
-    atomicWriteFile(path, edited);
+    publishConfigWrite(path, held, (destination, hooks) => atomicWriteFile(destination, edited, undefined, hooks));
     return { ok: true, changed: true };
   } catch (error) {
     if (isAtomicResidualError(error)) innerResidual = true;
@@ -1498,7 +1499,7 @@ function applyConfigEditsAtomically(path: string, edit: (tempPath: string) => Co
 
 export type MultiAgentV2TransitionResult =
   | { ok: true; changed: boolean; threadLimit: number | null }
-  | { ok: false; error: string };
+  | { ok: false; error: string; retryable?: boolean };
 
 function transitionConfigError(content: string): string | null {
   if (/^\s*(?:features\.multi_agent_v2(?:\.[A-Za-z0-9_]+)?|agents\.max_threads)\s*=/m.test(content)) {
@@ -1532,20 +1533,21 @@ function transitionConfigError(content: string): string | null {
 /**
  * Toggle native multi_agent_v2 while moving the active thread limit to the key
  * valid for the destination version. Any failed command/postcondition restores
- * the exact original config bytes.
+ * the exact original config bytes; alias drift restores only the locked canonical target.
  */
 export function transitionMultiAgentV2(
   enabled: boolean,
-  toggleFeature: (enabled: boolean) => void,
+  toggleFeature: (enabled: boolean, env: NodeJS.ProcessEnv, validateBeforeSpawn: () => void) => void,
   options: { configPath?: string; threadLimit?: number; heldConfigWriteLock?: LockHandle } = {},
 ): MultiAgentV2TransitionResult {
   if (options.threadLimit !== undefined && (!Number.isInteger(options.threadLimit) || options.threadLimit < 1)) {
     return { ok: false, error: "thread limit must be an integer >= 1" };
   }
   const path = options.configPath ?? activeCodexConfigPath();
-  const runTransition = (): MultiAgentV2TransitionResult => {
+  const runTransition = (held: LockHandle): MultiAgentV2TransitionResult => {
   const original = readConfigText(path);
   if (original === null) return { ok: false, error: `config.toml not readable at ${path}` };
+  const originalBytes = readFileSync(path);
   const preflightError = transitionConfigError(original);
   if (preflightError) return { ok: false, error: preflightError };
   const beforeEnabled = isMultiAgentV2Enabled(path);
@@ -1571,18 +1573,19 @@ export function transitionMultiAgentV2(
   }
   const migratedComment = activeThreadComment(original, beforeEnabled);
   try {
+    if (beforeEnabled !== enabled) assertNativeConfigWriteDestination(path, held);
     if (enabled) {
       if (!beforeEnabled) {
-        const staged = applyConfigEditsAtomically(path, tempPath => {
+        const staged = applyConfigEditsAtomically(path, held, tempPath => {
           const v2 = ensureDisabledV2Config(threadLimit, tempPath, migratedComment);
           if (!v2.ok) return v2;
           return editAgentsMaxThreads(null, tempPath);
         });
         if (!staged.ok) throw new Error(staged.error);
-        toggleFeature(true);
+        runConfigWriteChild(path, held, (env, validate) => toggleFeature(true, env, validate), originalBytes);
       }
       if (!isMultiAgentV2Enabled(path)) throw new Error("codex feature command did not enable multi_agent_v2");
-      const target = applyConfigEditsAtomically(path, tempPath => {
+      const target = applyConfigEditsAtomically(path, held, tempPath => {
         const v2 = threadLimit === null
           ? removeMaxConcurrentThreads(tempPath)
           : setMaxConcurrentThreads(threadLimit, tempPath, migratedComment);
@@ -1592,9 +1595,9 @@ export function transitionMultiAgentV2(
       if (!target.ok) throw new Error(target.error);
       if (hasAgentsMaxThreads(path) || getMaxConcurrentThreads(path) !== threadLimit) throw new Error("v2 thread-limit migration postcondition failed");
     } else {
-      if (beforeEnabled) toggleFeature(false);
+      if (beforeEnabled) runConfigWriteChild(path, held, (env, validate) => toggleFeature(false, env, validate), originalBytes);
       if (isMultiAgentV2Enabled(path)) throw new Error("codex feature command did not disable multi_agent_v2");
-      const target = applyConfigEditsAtomically(path, tempPath => {
+      const target = applyConfigEditsAtomically(path, held, tempPath => {
         const v2 = removeMaxConcurrentThreads(tempPath);
         if (!v2.ok) return v2;
         return editAgentsMaxThreads(threadLimit, tempPath, migratedComment);
@@ -1605,8 +1608,9 @@ export function transitionMultiAgentV2(
     return { ok: true, changed: readConfigText(path) !== original, threadLimit };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    if (err instanceof ConfigWriteDestinationChanged) return { ok: false, error: message, retryable: false };
     try {
-      atomicWriteFile(path, original);
+      publishConfigWrite(path, held, (destination, hooks) => atomicWriteFile(destination, original, undefined, hooks));
       return { ok: false, error: message };
     } catch (rollbackErr) {
       return { ok: false, error: `${message}; rollback failed: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}` };
@@ -1624,6 +1628,6 @@ export function transitionMultiAgentV2(
    * same lock file would refuse itself.
    */
   const locked = withConfigWriteLockHeld(path, options.heldConfigWriteLock, runTransition);
-  if (!locked.ok) return { ok: false, error: CONFIG_WRITE_LOCKED_MESSAGE };
+  if (!locked.ok) return { ok: false, error: configWriteLockFailureMessage(locked), ...(locked.error === "unsafe" ? { retryable: false } : {}) };
   return locked.value;
 }

@@ -25,9 +25,8 @@
  *   then this one; the injector takes this one first, then N, then C — and the
  *   coordinated restore path follows that same file-first order
  *   (`restoreNativeCodexAsyncImpl` acquires this lock before its `withCodexWriteLock`
- *   journal replay), so no cross-lock inversion remains. Even if one ever did,
- *   it could not deadlock: this lock never blocks, so a second acquire fails
- *   instantly and the other writer's bounded wait proceeds.
+ *   journal replay), so no cross-lock inversion remains. Synchronous
+ *   acquisition fails fast; asynchronous acquisition has a bounded wait.
  * - The injector's held section contains awaits (`withCodexWriteLock` is
  *   async), so the lock must NOT be implicitly reentrant — a same-process
  *   writer that slipped inside on a process-global check would interleave
@@ -40,117 +39,241 @@
  *   prompt store lock already exposes. Async callers (the injector) use the
  *   bounded wait in `acquireConfigWriteLock`.
  */
-import { release, stillHeld, tryAcquire, type LockHandle } from "./prompt-lock";
+import { atomicWriteFileStreamed, type AtomicWriteHooks } from "../config/atomic-write";
+import { lstatSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { basename, dirname, join, resolve } from "node:path";
+import { release, stillHeld, tryAcquire, type AcquireResult, type LockHandle } from "./prompt-lock";
 
-/** The lock file lives beside the config it serializes: `config.toml.ocx-write.lock`. */
-export function configWriteLockPath(configPath: string): string {
-  return `${configPath}.ocx-write.lock`;
-}
-
-/**
- * The user-facing sentence every writer reports when the section is busy.
- * One shared string keeps every surface — CLI, management routes, restore —
- * telling the operator the same thing.
- */
-export const CONFIG_WRITE_LOCKED_MESSAGE =
-  "another opencodex process is writing Codex configuration — retry shortly";
-
-export type ConfigWriteLockOutcome<T> =
-  | { ok: true; value: T }
-  | { ok: false; error: "locked" };
-
-/**
- * Acquire the config write lock for one synchronous section.
- *
- * Re-exported with the narrower contract this module owns so callers never
- * touch prompt-lock's path arguments directly. Release failures are release()'s
- * own problem (a superseded token means someone else's lock now owns the path);
- * the caller's result stands on what its section did.
- */
-export function withConfigWriteLock<T>(
-  configPath: string,
-  run: (handle: LockHandle) => T,
-): ConfigWriteLockOutcome<T> {
-  const acquired = tryAcquire(configWriteLockPath(configPath));
-  if (!acquired.ok) return { ok: false, error: "locked" };
+interface Destination { canonical: string; inode: string | null }
+const destinations = new WeakMap<LockHandle, Destination>();
+function destination(path: string): Destination {
+  const absolute = resolve(path);
+  let canonical: string;
+  try { canonical = realpathSync(absolute); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    canonical = join(realpathSync(dirname(absolute)), basename(absolute));
+  }
   try {
-    return { ok: true, value: run(acquired.handle) };
-  } finally {
-    release(acquired.handle);
+    const stat = statSync(canonical, { bigint: true });
+    return { canonical, inode: `${stat.dev}:${stat.ino}` };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return { canonical, inode: null };
   }
 }
-
-/** True while this process still owns the lock `handle` was acquired on. */
-export function configWriteLockHeld(handle: LockHandle): boolean {
-  return stillHeld(handle);
+/** Symlink aliases share the lock beside their canonical write destination. */
+export function configWriteLockPath(configPath: string): string {
+  return `${destination(configPath).canonical}.ocx-write.lock`;
 }
+export const CONFIG_WRITE_LOCKED_MESSAGE =
+  "another opencodex process is writing Codex configuration — retry shortly";
+export type ConfigWriteLockOutcome<T> =
+  | { ok: true; value: T }
+  | Exclude<AcquireResult, { ok: true }>;
 
-/**
- * Release a handle from `acquireConfigWriteLock`. A superseded token means the
- * path already belongs to someone else's lock, so a release failure is the
- * caller's signal that its section did not hold to the end.
- */
-export function releaseConfigWriteLock(handle: LockHandle): void {
-  release(handle);
+function acquire(configPath: string): AcquireResult {
+  const target = destination(configPath);
+  const acquired = tryAcquire(`${target.canonical}.ocx-write.lock`);
+  if (acquired.ok) destinations.set(acquired.handle, target);
+  return acquired;
 }
-
+export function withConfigWriteLock<T>(configPath: string, run: (handle: LockHandle) => T): ConfigWriteLockOutcome<T> {
+  const acquired = acquire(configPath);
+  if (!acquired.ok) return acquired;
+  try { return { ok: true, value: run(acquired.handle) }; }
+  finally { release(acquired.handle); }
+}
+export function configWriteLockHeld(handle: LockHandle): boolean { return stillHeld(handle); }
+export function releaseConfigWriteLock(handle: LockHandle): void { release(handle); }
 export type { LockHandle };
 
-/**
- * Run `run` under the lock the caller already holds, or take the lock itself.
- * The explicit-held contract above applies: `held` must be a live handle on
- * THIS config's lock file — a handle minted on another path is refused rather
- * than trusted, since it would let the section run unprotected.
- */
+export function assertConfigWriteDestination(configPath: string, held: LockHandle): string {
+  const current = destination(configPath);
+  const expected = destinations.get(held);
+  if (!stillHeld(held) || held.path !== `${current.canonical}.ocx-write.lock`
+    || (expected && (current.canonical !== expected.canonical || current.inode !== expected.inode))) {
+    throw new Error("Codex configuration destination changed; files and recovery evidence were preserved.");
+  }
+  if (!expected) destinations.set(held, current);
+  return current.canonical;
+}
+/** A writer advances the witness only through its confirmed publication hook. */
+export function publishConfigWrite<T>(configPath: string, held: LockHandle, run: (destination: string, hooks: AtomicWriteHooks) => T): T {
+  const canonical = assertConfigWriteDestination(configPath, held);
+  return run(canonical, {
+    validateBeforeRename: () => { assertConfigWriteDestination(configPath, held); },
+    afterRename: () => {
+      const after = destination(configPath);
+      if (!stillHeld(held) || after.canonical !== canonical) throw new Error("Codex configuration destination changed; recovery evidence was preserved.");
+      destinations.set(held, after);
+      const watched = targets.get(held);
+      if (watched) for (const [path, expected] of watched) if (expected.canonical === canonical) watched.set(path, after);
+    },
+  });
+}
+/** Native children use the acquisition witness, never a fresh home resolution. */
+export class ConfigWriteDestinationChanged extends Error {
+  readonly retryable = false;
+  constructor(message = "Codex configuration destination changed; files and recovery evidence were preserved.") { super(message); }
+}
+/** Refuse before transition staging: native Codex always writes home/config.toml. */
+export function assertNativeConfigWriteDestination(configPath: string, held: LockHandle): string {
+  let canonical: string;
+  try { canonical = assertConfigWriteDestination(configPath, held); }
+  catch { throw new ConfigWriteDestinationChanged(); }
+  const home = realpathSync(dirname(canonical));
+  if (basename(canonical) !== "config.toml" || canonical !== join(home, "config.toml")) {
+    throw new ConfigWriteDestinationChanged("Native feature changes are unavailable when config.toml is a symlink to a differently named file.");
+  }
+  return canonical;
+}
+function canonicalFileIdentity(canonical: string): string | null {
+  const current = destination(canonical);
+  if (current.canonical !== canonical) throw new Error("canonical configuration target was redirected");
+  let stat;
+  try { stat = lstatSync(canonical, { bigint: true }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" && current.inode === null) return null;
+    throw error;
+  }
+  if (!stat.isFile() || `${stat.dev}:${stat.ino}` !== current.inode) throw new Error("canonical configuration target is not the observed regular file");
+  return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+}
+export function runConfigWriteChild(
+  configPath: string, held: LockHandle,
+  run: (env: NodeJS.ProcessEnv, validateBeforeSpawn: () => void) => void,
+  transitionPreimage?: Buffer,
+): void {
+  const canonical = assertNativeConfigWriteDestination(configPath, held);
+  let preimage: Buffer | null = null, captured = false;
+  const validateBeforeSpawn = () => {
+    assertNativeConfigWriteDestination(configPath, held);
+    const identity = canonicalFileIdentity(canonical);
+    const bytes = identity === null ? null : readFileSync(canonical);
+    if (canonicalFileIdentity(canonical) !== identity) throw new ConfigWriteDestinationChanged();
+    preimage = transitionPreimage ?? bytes;
+    captured = true;
+  };
+  publishConfigWrite(configPath, held, (_canonical, hooks) => {
+    const env = { ...process.env };
+    // Windows env names are case-insensitive; wrappers may honor Orca's override.
+    for (const key of Object.keys(env)) {
+      if (["CODEX_HOME", "ORCA_CODEX_HOME"].includes(key.toUpperCase())) delete env[key];
+    }
+    env.CODEX_HOME = realpathSync(dirname(canonical));
+    validateBeforeSpawn();
+    try { run(env, validateBeforeSpawn); }
+    // Even a failed child can have replaced config.toml. Check before rollback.
+    finally {
+      let childIdentity: string | null | undefined;
+      try {
+        childIdentity = canonicalFileIdentity(canonical);
+        hooks.afterRename?.(canonical);
+      } catch {
+        try {
+          const validateRecovery = (targetPath = canonical) => {
+            if (targetPath !== canonical || !captured || childIdentity === undefined || !stillHeld(held)
+              || held.path !== `${canonical}.ocx-write.lock`
+              || canonicalFileIdentity(canonical) !== childIdentity) {
+              throw new Error("canonical configuration target changed before recovery");
+            }
+          };
+          validateRecovery();
+          if (preimage === null) { validateRecovery(); if (childIdentity !== null) unlinkSync(canonical); }
+          else atomicWriteFileStreamed(canonical, fd => writeFileSync(fd, preimage!), { validateBeforeRename: validateRecovery });
+          destinations.set(held, destination(canonical));
+        } catch (recoveryError) {
+          let evidence = "recovery evidence could not be persisted";
+          try {
+            const recoveryPath = `${canonical}.ocx-native-preimage.${randomUUID()}`;
+            atomicWriteFileStreamed(recoveryPath, fd => writeFileSync(fd, preimage ?? Buffer.from('{"preimage":"absent"}\n')));
+            evidence = `recovery evidence retained at ${recoveryPath}`;
+          } catch { /* Preserve the refusal and diagnostic even when evidence storage fails. */ }
+          throw new ConfigWriteDestinationChanged(`Codex configuration destination changed; canonical preimage recovery refused: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}; ${evidence}.`);
+        }
+        throw new ConfigWriteDestinationChanged("Codex configuration destination changed; canonical preimage restored and recovery evidence preserved.");
+      }
+    }
+  });
+}
 export function withConfigWriteLockHeld<T>(
-  configPath: string,
-  held: LockHandle | undefined,
-  run: (handle: LockHandle) => T,
+  configPath: string, held: LockHandle | undefined, run: (handle: LockHandle) => T,
 ): ConfigWriteLockOutcome<T> {
   if (held !== undefined) {
-    if (held.path !== configWriteLockPath(configPath) || !stillHeld(held)) {
-      return { ok: false, error: "locked" };
-    }
+    try { assertConfigWriteDestination(configPath, held); }
+    catch { return { ok: false, error: "unsafe", detail: held.path }; }
     return { ok: true, value: run(held) };
   }
   return withConfigWriteLock(configPath, run);
 }
-
-/** Uniform, small, jittered retry spacing — same reasoning as codex-write-lock. */
 const RETRY_MIN_MS = 25;
 const RETRY_MAX_MS = 75;
-
-/**
- * How long an async caller waits for the advisory lock. Sections under it are
- * millisecond-scale; the one long holder is `transitionMultiAgentV2`, which can
- * outlast this while it waits on the `codex features` subprocess — and refusing
- * an injection after a short wait beats both queueing behind a subprocess and
- * racing it.
- */
 export const CONFIG_WRITE_LOCK_WAIT_MS = 2_000;
-
-/**
- * Bounded wait for the advisory lock, for async callers only.
- *
- * Returns `locked` once the deadline passes — the injector maps that to a
- * retryable busy result rather than a hard refusal, because the holder is by
- * construction finishing a short section.
- */
 export async function acquireConfigWriteLock(
   configPath: string,
-  options: { timeoutMs?: number; nowMs?: () => number } = {},
-): Promise<{ ok: true; handle: LockHandle } | { ok: false; error: "locked" }> {
+  options: { timeoutMs?: number; nowMs?: () => number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<AcquireResult> {
   const timeoutMs = options.timeoutMs ?? CONFIG_WRITE_LOCK_WAIT_MS;
-  const now = options.nowMs ?? (() => Date.now());
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 10_000) throw new RangeError("Invalid config lock timeout");
+  const now = options.nowMs ?? (() => performance.now());
+  const sleep = options.sleep ?? (ms => new Promise(done => setTimeout(done, ms)));
   const deadline = now() + timeoutMs;
   for (;;) {
-    const acquired = tryAcquire(configWriteLockPath(configPath));
-    if (acquired.ok) return acquired;
-    if (now() >= deadline) return { ok: false, error: "locked" };
-    const wait = Math.min(
-      deadline - now(),
-      RETRY_MIN_MS + Math.floor(Math.random() * (RETRY_MAX_MS - RETRY_MIN_MS + 1)),
-    );
-    await new Promise(done => setTimeout(done, Math.max(1, wait)));
+    const acquired = acquire(configPath);
+    if (acquired.ok || acquired.error === "unsafe") return acquired;
+    const remaining = deadline - now();
+    if (timeoutMs === 0 || remaining <= 0) return { ok: false, error: "locked" };
+    await sleep(Math.max(1, Math.min(remaining,
+      RETRY_MIN_MS + Math.floor(Math.random() * (RETRY_MAX_MS - RETRY_MIN_MS + 1)))));
+  }
+}
+
+const targets = new WeakMap<LockHandle, Map<string, Destination>>();
+export function watchConfigWriteTargets(held: LockHandle, paths: readonly string[]): void {
+  let watched = targets.get(held);
+  if (!watched) { watched = new Map(); targets.set(held, watched); }
+  for (const path of paths) if (!watched.has(path)) watched.set(path, destination(path));
+}
+export function publishConfigWriteTarget<T>(
+  configPath: string, held: LockHandle, path: string, run: (destination: string, hooks: AtomicWriteHooks) => T,
+): T {
+  assertConfigWriteDestination(configPath, held);
+  watchConfigWriteTargets(held, [path]);
+  const watched = targets.get(held)!, expected = watched.get(path)!, current = destination(path);
+  if (expected.canonical !== current.canonical || expected.inode !== current.inode) {
+    throw new Error("Codex artifact destination changed; files and recovery evidence were preserved.");
+  }
+  if (path === configPath) {
+    const value = publishConfigWrite(configPath, held, run);
+    return value;
+  }
+  return run(current.canonical, {
+    validateBeforeRename: () => {
+      assertConfigWriteDestination(configPath, held);
+      const now = destination(path);
+      if (expected.canonical !== now.canonical || expected.inode !== now.inode) throw new Error("Codex artifact destination changed; files and recovery evidence were preserved.");
+    },
+    afterRename: () => {
+      assertConfigWriteDestination(configPath, held);
+      const after = destination(path);
+      if (after.canonical !== current.canonical) throw new Error("Codex artifact destination changed; recovery evidence was preserved.");
+      watched.set(path, after);
+    },
+  });
+}
+
+export function configWriteLockFailureMessage(failure: Exclude<AcquireResult, { ok: true }>): string {
+  return failure.error === "unsafe"
+    ? `Unsafe Codex configuration lock at ${failure.detail}; deliberate removal is required. Files and recovery evidence were preserved.`
+    : CONFIG_WRITE_LOCKED_MESSAGE;
+}
+
+export class ConfigWriteLockRefusal extends Error {
+  readonly retryable: boolean;
+  constructor(failure: Exclude<AcquireResult, { ok: true }>) {
+    super(configWriteLockFailureMessage(failure));
+    this.retryable = failure.error === "locked";
   }
 }

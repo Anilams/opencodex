@@ -21,16 +21,18 @@
  * is handled by the per-target byte checks in the write path, and the rename
  * window itself is documented as irreducible from user space.
  */
-import { existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { withLockClaim } from "./prompt-lock-claim";
+import { UnsafeLockNamespace, withLockClaim } from "./prompt-lock-claim";
+
+import { ownerDefaults, ownEvidence, ownerState, safeNamespace, type OwnerDeps, type OwnerEvidence } from "./prompt-lock-owner";
 
 const FILE_MODE = 0o600;
 
 /** A lock younger than this is respected even if its pid looks gone. */
 export const STALE_AFTER_MS = 10_000;
 
-export interface LockRecord {
+export interface LockRecord extends OwnerEvidence {
   token: string;
   pid: number;
   acquiredAt: number;
@@ -43,26 +45,15 @@ export interface LockHandle {
 
 export type AcquireResult =
   | { ok: true; handle: LockHandle }
-  | { ok: false; error: "locked" };
+  | { ok: false; error: "locked" }
+  | { ok: false; error: "unsafe"; detail: string };
 
-export interface LockDeps {
-  /** Injectable so tests can simulate a live or dead owner. */
-  isProcessAlive: (pid: number) => boolean;
+export interface LockDeps extends Partial<OwnerDeps> {
+  isProcessAlive: (pid: number) => boolean | undefined;
   now: () => number;
+  onClaimInitialized?: () => void;
 }
-
-const defaultDeps: LockDeps = {
-  isProcessAlive: pid => {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch (error) {
-      // EPERM means it exists but belongs to another user.
-      return (error as NodeJS.ErrnoException).code === "EPERM";
-    }
-  },
-  now: () => Date.now(),
-};
+const defaultDeps: LockDeps = { ...ownerDefaults, now: () => Date.now() };
 
 function readRecord(path: string): LockRecord | null {
   try {
@@ -74,30 +65,23 @@ function readRecord(path: string): LockRecord | null {
   }
 }
 
-/** True when the holder is gone AND the lock is older than the grace window. */
-function isStale(path: string, record: LockRecord | null, deps: LockDeps): boolean {
-  if (record === null) {
-    // wx creates a file before writing its JSON. A fresh empty/truncated
-    // record can be an initializing writer, not abandoned debris.
-    try { return deps.now() - statSync(path).mtimeMs > STALE_AFTER_MS; }
-    catch { return false; }
-  }
-  if (deps.isProcessAlive(record.pid)) return false;
-  return deps.now() - record.acquiredAt > STALE_AFTER_MS;
-}
-
-/**
- * One attempt. The caller decides whether to retry — a loser must go back to
- * re-reading the lock rather than assuming its quarantine still applies.
- */
+/** One attempt, including namespace validation and serialized stale observation. */
 export function tryAcquire(path: string, deps: LockDeps = defaultDeps): AcquireResult {
+  const resolved = { ...ownerDefaults, ...deps };
   const token = randomBytes(8).toString("hex");
-  const reserved = withLockClaim(path, token, defaultDeps.isProcessAlive, () => acquireReserved(path, token, deps));
-  return reserved.ok ? reserved.value : { ok: false, error: "locked" };
+  try {
+    if (!safeNamespace(path, "file", resolved, true)) throw new UnsafeLockNamespace(path);
+    const reserved = withLockClaim(path, token, resolved,
+      () => acquireReserved(path, token, resolved), deps.onClaimInitialized);
+    return reserved.ok ? reserved.value : { ok: false, error: "locked" };
+  } catch (error) {
+    if (error instanceof UnsafeLockNamespace) return { ok: false, error: "unsafe", detail: error.path };
+    throw error;
+  }
 }
 
-function acquireReserved(path: string, token: string, deps: LockDeps): AcquireResult {
-  const record: LockRecord = { token, pid: process.pid, acquiredAt: deps.now() };
+function acquireReserved(path: string, token: string, deps: OwnerDeps & LockDeps): AcquireResult {
+  const record: LockRecord = { token, ...ownEvidence(deps), acquiredAt: deps.now() };
   const body = JSON.stringify(record);
 
   try {
@@ -107,7 +91,11 @@ function acquireReserved(path: string, token: string, deps: LockDeps): AcquireRe
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
   }
 
-  if (!isStale(path, readRecord(path), deps)) return { ok: false, error: "locked" };
+  const previous = readRecord(path);
+  const state = ownerState(previous, deps);
+  if (state === "unsafe") return { ok: false, error: "unsafe", detail: path };
+  if (state !== "dead" || !previous || !Number.isFinite(previous.acquiredAt)
+    || deps.now() - previous.acquiredAt <= STALE_AFTER_MS) return { ok: false, error: "locked" };
 
   // Quarantine under the reservation; no cooperating successor can replace
   // the observed stale record between our check and this rename.
@@ -139,6 +127,7 @@ function acquireReserved(path: string, token: string, deps: LockDeps): AcquireRe
  * when we were superseded, which the caller surfaces as `write_superseded`.
  */
 export function release(handle: LockHandle): boolean {
+  if (!safeNamespace(handle.path, "file", ownerDefaults)) return false;
   const record = readRecord(handle.path);
   if (record === null || record.token !== handle.token) return false;
   try {
@@ -151,6 +140,6 @@ export function release(handle: LockHandle): boolean {
 
 /** True when the on-disk lock is still the one this handle acquired. */
 export function stillHeld(handle: LockHandle): boolean {
-  if (!existsSync(handle.path)) return false;
+  if (!existsSync(handle.path) || !safeNamespace(handle.path, "file", ownerDefaults)) return false;
   return readRecord(handle.path)?.token === handle.token;
 }

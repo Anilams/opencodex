@@ -1,3 +1,4 @@
+import { beginCodexWriteSection, cleanExternalProviderJournal, publishCodexArtifact } from "./config-write-section";
 import { assertCodexHomeOwner, codexHomeOwnerBlocksCompensation, CodexHomeOwnerRefusal, type CodexHomeOwnerRefusalReason } from "../codex-home-owner";
 import { loadConfig } from "../../config";
 import { shouldSyncCodexOnStart } from "../desired-state";
@@ -26,7 +27,7 @@ import {
 } from "../user-identity";
 import {
   journaledInjectedCatalogPath,
-  removeJournal,
+  JOURNAL_PATH,
   releaseJournalHomeBinding,
   restoreJournalState,
 } from "../journal";
@@ -52,7 +53,7 @@ import {
 import {
   acquireConfigWriteLock,
   releaseConfigWriteLock,
-  withConfigWriteLockHeld,
+  configWriteLockFailureMessage, withConfigWriteLockHeld,
 } from "../config-write-lock";
 import type { LockHandle } from "../config-write-lock";
 import { shouldInjectApiAuthHeader } from "../loopback-target";
@@ -117,6 +118,7 @@ export interface CodexRestoreConfigResult {
     | "failed";
   message: string;
   retained?: RetainedCodexProviderTable;
+  retryable?: boolean;
 }
 
 export interface CodexRestoreCatalogResult {
@@ -362,13 +364,14 @@ function restoreCodexConfigInline(
    * and left preimage compensation replaying over bytes that writer committed.
    */
   const locked = withConfigWriteLockHeld(CODEX_CONFIG_PATH, heldConfigWriteLock, (held) => {
+    beginCodexWriteSection(held);
     assertCodexHomeOwner(getCodexHome());
     beforeRestoreConfigForTests?.(kind);
     assertCodexHomeOwner(getCodexHome());
     const preImages = captureCodexPreImages();
     const result = restoreCodexConfigInlineImpl(kind, options, held);
     if (result.state === "failed") {
-      const compensated = restoreCodexPreImages(preImages);
+      const compensated = restoreCodexPreImages(preImages, held);
       if (!compensated.complete) throw new CodexPartialWriteError(compensated.unrestored);
     }
     return result;
@@ -377,7 +380,7 @@ function restoreCodexConfigInline(
     // Nothing was captured or written — there is nothing to compensate.
     return {
       state: "failed", changed: false, action: "failed",
-      message: "Another process is writing Codex configuration right now. Retry shortly.",
+      retryable: locked.error === "locked", message: configWriteLockFailureMessage(locked),
     };
   }
   return locked.value;
@@ -407,12 +410,13 @@ function restoreCodexConfigInlineImpl(
     const capturedBlock = options.removeProviderTable === true ? null : readOcxProviderTableBlock();
     const journal = restoreJournalState({ heldConfigWriteLock });
     if (journal.ownershipRefusal) throw new CodexHomeOwnerRefusal(journal.ownershipRefusal);
+    if (journal.lockUnsafe) return { state: "failed", changed: false, action: "failed", retryable: false, message: journal.lockUnsafe };
     if (journal.lockBusy) {
       // Only reachable when this impl ran without a live held handle — the
       // outer section takes the file lock before anything else runs.
       return {
         state: "failed", changed: false, action: "failed",
-        message: "Another process is writing Codex configuration right now. Retry shortly.",
+        retryable: true, message: "Another process is writing Codex configuration right now. Retry shortly.",
       };
     }
     if (journal.unverified) {
@@ -460,7 +464,7 @@ function restoreCodexConfigInlineImpl(
       }
       // All native work and the final migration check succeeded. A field-level
       // fallback retains its snapshot, but no longer owns this Codex home.
-      releaseJournalHomeBinding();
+      publishCodexArtifact(JOURNAL_PATH, heldConfigWriteLock, (_path, hooks) => releaseJournalHomeBinding(hooks));
     }
     if (restored.success && retainedLines !== null) {
       return {
@@ -564,7 +568,7 @@ async function restoreNativeCodexAsyncImpl(
     // External-provider courtesy: only the stale journal is removed. The
     // history worker must not launch — it would turn a read-mostly courtesy
     // result into a history mutation on a home we do not own.
-    removeJournal();
+    cleanExternalProviderJournal();
     return externalProviderRestoreResult(activeProvider);
   }
 
@@ -612,9 +616,10 @@ async function restoreNativeCodexAsyncImpl(
         state: "failed",
         changed: false,
         action: "failed",
-        message: "Another process is writing Codex configuration right now. Retry shortly.",
+        retryable: configLock.error === "locked", message: configWriteLockFailureMessage(configLock),
       };
     } else try {
+    beginCodexWriteSection(configLock.handle);
     // The restore has no candidate bytes to witness; freshness comes from the
     // filesystem reads and the desired-state re-read performed under the lock.
     const witness = { authoritySnapshotId: "codex-native-restore" };
@@ -655,7 +660,7 @@ async function restoreNativeCodexAsyncImpl(
           if (restored.state === "failed") throw new CodexRestoreRefusal(restored);
         } catch (error) {
           if (codexHomeOwnerBlocksCompensation(getCodexHome(), error)) throw error;
-          const compensated = restoreCodexPreImages(preImages);
+          const compensated = restoreCodexPreImages(preImages, configLock.handle);
           if (!compensated.complete) throw new CodexPartialWriteError(compensated.unrestored);
           throw error;
         }
@@ -787,7 +792,7 @@ function restoreNativeCodexImpl(
 ): CodexNativeRestoreResult {
   const activeProvider = currentExternalCodexModelProvider();
   if (activeProvider) {
-    removeJournal();
+    cleanExternalProviderJournal();
     return externalProviderRestoreResult(activeProvider);
   }
   if (options.revalidateDesiredState && shouldSyncCodexOnStart(loadConfig())) {
