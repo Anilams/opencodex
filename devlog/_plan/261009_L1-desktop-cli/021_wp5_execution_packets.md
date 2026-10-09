@@ -26,3 +26,13 @@ docs-site build, Node import proof `node bin/ocx.mjs update --help`, and a read-
 Reflection (Kant): MISALIGNED → folded: G4 also owns `structure/runtime.md` (cap 600, replace only) and
 `structure/cli-management.md` (020:684, :737); main's verifier adds `tests/cli/cli-dispatch.test.ts`,
 `tests/cli/system-restart-client.test.ts`, `tests/cli/system-restart-client-package-tree.test.ts` (020:850).
+
+Audit (reviewer 01a11e4b): GO-WITH-FIXES (blockers=2), folded:
+1. `SupervisionInspector = (deps?: Parameters<typeof inspectDesktopSupervision>[0]) => DesktopSupervision` (G1).
+   Restart fallback (G3) keeps the restart target pid and calls `inspect({ targetPid })`; an unrelated Desktop pid never
+   blocks the target's recovery. Tests: unrelated pid → allowed; target-bound `unknown`+`desktopSeen:true` → blocked.
+2. Pre-stop targets (G2): Bun updater uses `targetPid: runtimeTrusted ? livePid : undefined` (src/update/index.ts:522-530);
+   the Node launcher passes no `targetPid` and relies on the inspector's own pid-file/runtime-port correlation
+   (bin/ocx.mjs:409). Missing target → inspector correlation only; mismatch → `unknown` (latch keeps a prior block).
+3. Every `unknown` fixture carries `desktopSeen` explicitly (false for pass-through, true for refusal cases).
+Live check: `service` has no `--dry-run` (src/service/cli.ts:169-186) → no live service command is run.
