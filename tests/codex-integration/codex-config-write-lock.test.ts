@@ -228,7 +228,7 @@ describe("every writer honors the shared lock", () => {
       const {restoreNativeCodex}=require('./src/codex/inject/restore');
       const {tryAcquire,release,stillHeld}=require('./src/codex/prompt-lock');
       const {configWriteLockPath}=require('./src/codex/config-write-lock');
-      const config=path.join(process.env.CODEX_HOME,'config.toml'),journal=path.join(process.env.CODEX_HOME,'opencodex-journal.json');
+      const config=require('./src/codex/paths').CODEX_CONFIG_PATH,journal=path.join(path.dirname(config),'opencodex-journal.json');
       const original=fs.readFileSync(config,'utf8');
       writeJournal(); fs.writeFileSync(config,'# opencodex-managed\\nopenai_base_url = "http://127.0.0.1:10100/v1"\\n');
       markJournalInjectedState(fs.readFileSync(config,'utf8'),null,{injectedOpenaiBaseUrl:'http://127.0.0.1:10100/v1',injectedRealtimeWsBaseUrl:null,injectedCatalogPath:null});
@@ -562,13 +562,15 @@ describe("SQLite order and retained recovery authority", () => {
       expect(out.sawConfigFirst).toBe(true); expect(out.freed).toBe(true);
       expect(readFileSync(config, "utf8")).toBe('model = "fixture"\n');
       holder.stdin.write("g"); holder.stdin.end(); expect(await holder.exited).toBe(0);
+      // Contention keeps its 5 s deadline. Successful cold-start injection also
+      // creates ACL-protected state on Windows; bound that separate work to 15 s.
       const retried = Bun.spawnSync([process.execPath, "-e", `
         console.log(JSON.stringify(await require('./src/codex/inject').injectCodexConfig(20201,undefined,{lockTimeoutMs:0})));
-      `], { cwd: repoRoot(), env, stdout: "pipe", stderr: "pipe", timeout: 5_000 });
+      `], { cwd: repoRoot(), env, stdout: "pipe", stderr: "pipe", timeout: process.platform === "win32" ? 15_000 : 5_000 });
       expect(retried.exitCode, retried.stderr.toString()).toBe(0);
       expect(JSON.parse(retried.stdout.toString().trim().split("\n").at(-1)!).success).toBe(true);
     } finally { holder.kill(); }
-  });
+  }, 30_000);
   test("post-publication commit and compensation failure retain a usable journal fallback", () => {
     const config = fixtureConfig('model = "native"\n'), home = require("node:fs").realpathSync(join(config, ".."));
     const child = Bun.spawnSync([process.execPath, "-e", `
@@ -641,7 +643,7 @@ describe("publication and unsafe caller regressions", () => {
       const fs=require('node:fs'),path=require('node:path');
       const locks=require('./src/codex/config-write-lock'),features=require('./src/codex/features');
       const prompts=require('./src/codex/prompt-layers'),journal=require('./src/codex/journal');
-      const config=path.join(process.env.CODEX_HOME,'config.toml'),store=path.join(process.env.CODEX_HOME,'opencodex-prompt.json');
+      const config=require('./src/codex/paths').CODEX_CONFIG_PATH,store=path.join(path.dirname(config),'opencodex-prompt.json');
       const lock=locks.configWriteLockPath(config),evidence=JSON.stringify({pid:123,token:'legacy',acquiredAt:0});fs.writeFileSync(lock,evidence);
       const before=fs.readFileSync(config,'utf8');
       const feature=features.setAgentsEnabled(false,config);

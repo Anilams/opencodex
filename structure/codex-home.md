@@ -319,15 +319,24 @@ successful child replacement advances the inode witness before subsequent parent
 PID/token file and bakery ticket. A contender still choosing makes peers refuse, and a
 later contender sees an earlier published ticket. Dead reservations are removed by their
 unique filename; stale observation cannot rename a live successor's reusable lock path.
-Lock and claim records include host and process-start evidence. Takeover requires a
-matching local host and a proven dead owner; a reused PID with a different start identity
-remains busy. Foreign-host, unknown-host, legacy and incomplete records are unsafe and
+Lock and claim records include host evidence and optional process-start evidence. Takeover requires a
+matching local host and two dead-PID observations; a reused PID with a different known start identity
+remains busy. Unknown start identity disables only that comparison: live or unknown PID liveness
+remains busy, and a dead lock owner is recoverable only past the grace window. Foreign-host, unknown-host, legacy and malformed records are unsafe and
 preserved for deliberate removal. Unknown process liveness remains busy. The lock file,
 claims directory and entries must have the expected type, current-user ownership on POSIX,
 and no symlinks. On Windows, namespace ownership relies on the per-user profile ACL;
 acquisition does not run a separate ACL hardener for claims directories.
-Machine identity and this process's start identity are read lazily once per process, including
-unavailable results. Another PID's start lookup runs only for a takeover decision, with a one-second command timeout.
+Machine identity is read lazily once per process, including unavailable results. Linux reads
+`/etc/machine-id`, falling back to `/var/lib/dbus/machine-id`, without spawning. Windows queries
+MachineGuid through trusted System32 reg.exe with argv, no shell, a three-second timeout and
+strict registry-key, REG_SZ and UUID parsing. Executable resolution uses the same OS system-directory
+resolver as trusted PowerShell and ignores PATH, SystemRoot and WINDIR. macOS retains its
+one-second sysctl boot-session lookup. If host discovery fails, a free lock can still be acquired,
+but its hostless record is unsafe for every later contender and requires deliberate removal.
+This process's start identity is cached where available; on Windows it is unknown without spawning.
+Another PID's start lookup runs only for a dead-owner takeover decision when the record has start
+evidence, with a one-second command timeout; Windows retains trusted PowerShell for that lookup.
 Choosing evidence is published atomically before the bakery scan.
 The last reservation removes its directory only with atomic empty-directory rmdir.
 Unsafe acquisition is non-retryable and carries the lock-path diagnostic through writer results.

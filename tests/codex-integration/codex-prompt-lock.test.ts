@@ -18,7 +18,7 @@ import {
   tryAcquire,
   type LockDeps,
 } from "../../src/codex/prompt-lock";
-import { createOwnerIdentity, ownEvidence, ownerDefaults } from "../../src/codex/prompt-lock-owner";
+import { createOwnerIdentity, ownEvidence, ownerDefaults, ownerState } from "../../src/codex/prompt-lock-owner";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { repoPath } from "../helpers/repo-root";
 
@@ -469,12 +469,14 @@ test("Windows acquisitions rely on profile ACLs without spawning a claims harden
 
 for (const available of [true, false]) test(`Windows identity commands are cached across acquisitions (${available ? "available" : "unavailable"})`, () => {
   const path = lockPath(), commands: string[][] = [];
+  const guid = "01234567-89ab-cdef-0123-456789abcdef";
   const identity = createOwnerIdentity({
-    platform: "win32", powerShellExe: () => "fixture-powershell.exe",
+    platform: "win32", regExe: () => "fixture-reg.exe", powerShellExe: () => "fixture-powershell.exe",
     runCommand(args, timeoutMs) {
-      expect(timeoutMs).toBe(1000);
+      expect(timeoutMs).toBe(args[0] === "fixture-reg.exe" ? 3000 : 1000);
       commands.push(args);
-      return available ? (args.at(-1)!.includes("MachineGuid") ? "fixture-machine" : "fixture-start") : undefined;
+      return available ? (args[0] === "fixture-reg.exe"
+        ? `HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography\r\n    MachineGuid    REG_SZ    ${guid}\r\n` : "fixture-start") : undefined;
     },
   });
   expect(commands).toHaveLength(0);
@@ -483,14 +485,15 @@ for (const available of [true, false]) test(`Windows identity commands are cache
     const result = tryAcquire(path, deps);
     expect(result.ok).toBe(true);
     const record = JSON.parse(readFileSync(path, "utf8"));
-    expect(record.host?.machine).toBe(available ? "fixture-machine" : undefined);
-    expect(record.processStart).toBe(available ? "fixture-start" : undefined);
-    expect(tryAcquire(path, deps).ok).toBe(false);
+    expect(record.host?.machine).toBe(available ? guid : undefined);
+    expect(record.processStart).toBeUndefined();
+    expect(tryAcquire(path, deps)).toEqual(available
+      ? { ok: false, error: "locked" } : { ok: false, error: "unsafe", detail: path });
     if (result.ok) expect(release(result.handle)).toBe(true);
   }
-  expect(commands).toHaveLength(2);
+  expect(commands).toHaveLength(1);
   expect(commands.filter(args => args.at(-1)!.includes("MachineGuid"))).toHaveLength(1);
-  expect(commands.filter(args => args.at(-1)!.includes(`Get-Process -Id ${process.pid} `))).toHaveLength(1);
+  expect(commands[0]).toEqual(["fixture-reg.exe", "query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"]);
   // A live or unknown foreign PID does not require a start-time subprocess.
   writeFileSync(path, JSON.stringify({ token: "old", pid: 999999999, acquiredAt: 0,
     host: identity.hostIdentity(), processStart: "fixture-start" }));
@@ -498,12 +501,85 @@ for (const available of [true, false]) test(`Windows identity commands are cache
     const result = tryAcquire(path, { ...deps, isProcessAlive: () => liveness });
     expect(result.ok).toBe(false);
   }
-  expect(commands).toHaveLength(2);
+  expect(commands).toHaveLength(1);
   if (available) {
     const result = tryAcquire(path, { ...deps, isProcessAlive: () => false });
     expect(result.ok).toBe(true);
-    expect(commands).toHaveLength(3);
-    expect(commands[2]!.at(-1)).toContain("Get-Process -Id 999999999 ");
+    expect(commands).toHaveLength(2);
+    expect(commands[1]!.at(-1)).toContain("Get-Process -Id 999999999 ");
     if (result.ok) expect(release(result.handle)).toBe(true);
   }
+});
+
+
+test("failed Windows identity command leaves our hostless record unsafe for an identified peer", () => {
+  const path = lockPath(); let calls = 0;
+  const unavailable = createOwnerIdentity({ platform: "win32", regExe: () => "fixture-reg.exe",
+    powerShellExe: () => { throw Error("PowerShell must not resolve during acquisition"); },
+    runCommand: () => { calls++; throw Error("injected command failure"); } });
+  const acquired = tryAcquire(path, { ...alive, ...unavailable });
+  expect(acquired.ok).toBe(true);
+  const before = readFileSync(path, "utf8");
+  expect(JSON.parse(before).host).toBeUndefined();
+  expect(tryAcquire(path, { ...dead, hostIdentity: () => ({ hostname: "peer", machine: "peer-machine" }) }))
+    .toEqual({ ok: false, error: "unsafe", detail: path });
+  expect(readFileSync(path, "utf8")).toBe(before); expect(calls).toBe(1);
+  if (acquired.ok) expect(release(acquired.handle)).toBe(true);
+});
+
+for (const lives of [[true], [undefined], [false, true], [false, undefined], [false, false]] as const) {
+  test(`unknown start evidence requires two dead observations (${lives.join(",")})`, () => {
+    const host = { hostname: "fixture", machine: "fixture-machine" };
+    let probes = 0, startProbes = 0;
+    const deps = { ...ownerDefaults, hostIdentity: () => host,
+      processStart: () => { startProbes++; return "another-start"; },
+      isProcessAlive: () => lives[Math.min(probes++, lives.length - 1)] };
+    expect(ownerState({ pid: 999999999, host }, deps)).toBe(lives.length === 2 && lives[1] === false ? "dead" : "live");
+    expect(probes).toBe(lives.length); expect(startProbes).toBe(0);
+  });
+}
+
+test("unknown Windows start evidence preserves grace, live owners and stale takeover", () => {
+  const host = { hostname: "fixture", machine: "fixture-machine" }, path = lockPath();
+  const deps = { ...dead, hostIdentity: () => host, processStart: () => undefined, platform: "win32" as const };
+  const body = JSON.stringify({ token: "old", pid: 999999999, host, acquiredAt: 1_000_000 });
+  writeFileSync(path, body);
+  expect(tryAcquire(path, { ...deps, now: () => 1_000_005 })).toEqual({ ok: false, error: "locked" });
+  expect(tryAcquire(path, { ...deps, isProcessAlive: () => true })).toEqual({ ok: false, error: "locked" });
+  expect(readFileSync(path, "utf8")).toBe(body);
+  const acquired = tryAcquire(path, deps); expect(acquired.ok).toBe(true);
+  if (acquired.ok) expect(release(acquired.handle)).toBe(true);
+});
+
+const guid = "01234567-89ab-cdef-0123-456789abcdef";
+for (const output of [guid, `HKEY_LOCAL_MACHINE\\OTHER\r\n    MachineGuid    REG_SZ    ${guid}`,
+  `HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography\r\n    MachineGuid    REG_BINARY    ${guid}`,
+  `HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography\r\n    MachineGuid    REG_SZ    invalid`,
+  `HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography\r\n    MachineGuid    REG_SZ    ${guid} extra`,
+  `HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography\r\n    MachineGuid    REG_SZ    ${guid}\r\n    MachineGuid    REG_SZ    ${guid}`]) {
+  test(`Windows identity rejects malformed registry output: ${JSON.stringify(output)}`, () => {
+    const identity = createOwnerIdentity({ platform: "win32", regExe: () => "fixture-reg.exe", runCommand: () => output });
+    expect(identity.hostIdentity()).toBeUndefined();
+  });
+}
+
+for (const primary of ["missing", "invalid", "valid"] as const) test(`Linux machine identity reads files without spawning (${primary})`, () => {
+  const reads: string[] = [], machine = "0123456789abcdef0123456789abcdef";
+  const identity = createOwnerIdentity({ platform: "linux",
+    runCommand: () => { throw Error("must not spawn"); }, readFile: path => {
+      reads.push(path);
+      if (path === "/etc/machine-id") {
+        if (primary === "missing") throw Error("missing");
+        return primary === "invalid" ? "not-machine-id" : machine + "\n";
+      }
+      return machine + "\n";
+    } });
+  expect(identity.hostIdentity()?.machine).toBe(machine); identity.hostIdentity();
+  expect(reads).toEqual(primary === "valid" ? ["/etc/machine-id"] : ["/etc/machine-id", "/var/lib/dbus/machine-id"]);
+});
+
+test.skipIf(process.platform !== "win32")("native Windows own evidence has a registry host and unknown start", () => {
+  const evidence = ownEvidence(ownerDefaults);
+  expect(evidence.host?.machine).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  expect(evidence.processStart).toBeUndefined();
 });

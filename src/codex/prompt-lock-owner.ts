@@ -1,5 +1,5 @@
 import { lstatSync, readFileSync, type Stats } from "node:fs";
-import { resolveTrustedWindowsPowerShellExe } from "../lib/windows-elevation";
+import { resolveTrustedWindowsPowerShellExe, resolveTrustedWindowsRegExe } from "../lib/windows-elevation";
 import { hostname } from "node:os";
 
 export interface HostIdentity { hostname: string; machine: string }
@@ -20,14 +20,24 @@ function command(args: string[], timeoutMs: number): string | undefined {
     return result.exitCode === 0 && value ? value : undefined;
   } catch { return undefined; }
 }
+const MACHINE_GUID_KEY = "HKLM\\SOFTWARE\\Microsoft\\Cryptography";
+function parseMachineGuid(output: string | undefined): string | undefined {
+  const lines = output?.trim().split(/\r?\n/);
+  if (lines?.length !== 2 || lines[0]!.trim().toLowerCase() !== "hkey_local_machine\\software\\microsoft\\cryptography") return undefined;
+  return /^[ \t]+MachineGuid[ \t]+REG_SZ[ \t]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[ \t]*$/i.exec(lines[1]!)?.[1]?.toLowerCase();
+}
 /** One lazy identity cache per process; unavailable results are cached too. */
 export function createOwnerIdentity({
   platform = process.platform, runCommand = command,
   powerShellExe = resolveTrustedWindowsPowerShellExe,
+  regExe = resolveTrustedWindowsRegExe,
+  readFile = (path: string) => readFileSync(path, "utf8"),
 }: {
   platform?: NodeJS.Platform;
   runCommand?: (args: string[], timeoutMs: number) => string | undefined;
   powerShellExe?: () => string;
+  regExe?: () => string;
+  readFile?: (path: string) => string;
 } = {}): Pick<OwnerDeps, "hostIdentity" | "processStart"> {
   let cachedHost: HostIdentity | undefined;
   let hostRead = false;
@@ -36,9 +46,16 @@ export function createOwnerIdentity({
     hostRead = true;
     let machine: string | undefined;
     try {
-      if (platform === "linux") machine = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+      if (platform === "linux") {
+        for (const path of ["/etc/machine-id", "/var/lib/dbus/machine-id"]) {
+          try {
+            const value = readFile(path).trim();
+            if (/^[0-9a-f]{32}$/i.test(value)) { machine = value.toLowerCase(); break; }
+          } catch { /* Try the fallback machine-id file. */ }
+        }
+      }
       else if (platform === "darwin") machine = runCommand(["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"], 1_000);
-      else if (platform === "win32") machine = runCommand([powerShellExe(), "-NoProfile", "-NonInteractive", "-Command", "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography').MachineGuid"], 1_000);
+      else if (platform === "win32") machine = parseMachineGuid(runCommand([regExe(), "query", MACHINE_GUID_KEY, "/v", "MachineGuid"], 3_000));
       if (machine) cachedHost = { hostname: hostname(), machine };
     } catch { /* Missing identity means no automatic takeover. */ }
     return cachedHost;
@@ -57,6 +74,9 @@ export function createOwnerIdentity({
   let ownStartRead = false;
   let cachedOwnStart: string | undefined;
   function processStart(pid: number): string | undefined {
+    // No spawn-free Windows start-time source is available here. Missing start
+    // evidence disables only the PID-reuse check, never the live-PID veto.
+    if (platform === "win32" && pid === process.pid) return undefined;
     if (pid !== process.pid) return probeProcessStart(pid);
     if (!ownStartRead) { ownStartRead = true; cachedOwnStart = probeProcessStart(pid); }
     return cachedOwnStart;
@@ -84,12 +104,13 @@ export function ownEvidence(deps: OwnerDeps): OwnerEvidence {
 export function ownerState(record: OwnerEvidence | null, deps: OwnerDeps): "dead" | "live" | "unsafe" {
   let host: HostIdentity | undefined;
   try { host = deps.hostIdentity(); } catch { return "unsafe"; }
-  if (!host || !record?.host || !record.processStart || !Number.isSafeInteger(record.pid) || record.pid <= 0
+  if (!host || !record?.host || (record.processStart !== undefined && (typeof record.processStart !== "string" || !record.processStart))
+    || !Number.isSafeInteger(record.pid) || record.pid <= 0
     || host.hostname !== record.host.hostname || host.machine !== record.host.machine) return "unsafe";
   try {
     // Probe another PID's start only when liveness permits a takeover decision.
     if (deps.isProcessAlive(record.pid) !== false) return "live";
-    const start = deps.processStart(record.pid);
+    const start = record.processStart === undefined ? undefined : deps.processStart(record.pid);
     // A reused PID is not permission to remove another process's record.
     if (start !== undefined && start !== record.processStart) return "live";
     return deps.isProcessAlive(record.pid) === false ? "dead" : "live";
