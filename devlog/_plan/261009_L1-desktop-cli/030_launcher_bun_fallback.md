@@ -1127,3 +1127,12 @@ Open product/design question: none within accepted wp3 scope. Recorded implement
   Verify on the combined tree before the last push of the later PR.
 - **F6:** add `tests/ci-workflows/bun-runtime.test.ts` to the focused verifier command.
 
+
+
+## r6 amendment (hosted CI, 2026-10-09)
+
+Production budget raised from 750 ms to `PATH_BUN_PROBE_BUDGET_MS = 5_000` in `bin/ocx.mjs`. Windows CI run
+37894746375 (`windows 9/9`) rejected a valid PATH Bun: the two cold probes of a freshly copied `bun.exe` exceeded 750 ms
+under on-access scanning. The fallback runs only when the bundled runtime is unusable, so a larger bound costs nothing
+on the normal path; it stays a total bound shared by both probes.
+

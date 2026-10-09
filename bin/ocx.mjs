@@ -894,6 +894,8 @@ const BUN_OVERRIDE_ENV = "OPENCODEX_BUN_PATH";
 // imported; tests/cli/ocx-launcher-source.test.ts pins the two together.
 const BUN_RUNTIME_SOURCE_ENV = "OCX_BUN_RUNTIME_SOURCE";
 const BUN_RUNTIME_PATH_ENV = "OCX_BUN_RUNTIME_PATH";
+/** Total budget for validating a PATH Bun fallback (both probes together). */
+const PATH_BUN_PROBE_BUDGET_MS = 5_000;
 
 function findBunBinary(bunDir) {
   // The bundled `bun` package ships the binary as bin/bun.exe on every platform;
@@ -952,7 +954,10 @@ function resolveBun({ allowInstall = true } = {}) {
   }
   if (bin) return { path: bin, source: "bundled" };
 
-  const pathBun = findPathBun({ pinnedVersion: pinnedBunVersion(), deadlineMs: 750 });
+  // Reached only when the bundled runtime is unusable. The two probes start the candidate Bun
+  // cold, and on Windows a first run of a copied bun.exe is often held by an on-access scan for
+  // well over a second, so the total budget is generous rather than interactive-tight.
+  const pathBun = findPathBun({ pinnedVersion: pinnedBunVersion(), deadlineMs: PATH_BUN_PROBE_BUDGET_MS });
   if (pathBun) {
     console.error(`opencodex: using PATH Bun ${pathBun.version}.`);
     return { path: pathBun.path, source: "process" };

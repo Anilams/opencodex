@@ -28,7 +28,9 @@ describe("ocx.mjs package launcher (source invariants)", () => {
 
   test("fallback derives its compatibility floor from the package dependency", () => {
     expect(source).toContain('typeof pkg.dependencies?.bun === "string" ? pkg.dependencies.bun : ""');
-    expect(source).toContain("pinnedVersion: pinnedBunVersion(), deadlineMs: 750");
+    expect(source).toContain("pinnedVersion: pinnedBunVersion(), deadlineMs: PATH_BUN_PROBE_BUDGET_MS");
+    // Bounded, but sized for a cold first run of a scanned bun.exe on Windows.
+    expect(source).toContain("const PATH_BUN_PROBE_BUDGET_MS = 5_000;");
     expect(source).not.toContain('pinnedVersion: "1.4.2"');
   });
 
